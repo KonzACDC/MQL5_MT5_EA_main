@@ -27,7 +27,7 @@ enum ENUM_LOT_OR_RISK
   };
 //--- input parameters
 input bool BBpattern1= true;
-input bool BBpattern2 = true
+input bool BBpattern2 = true;
 input int MaxPosition = 1;
 input int   InpStopLoss       = 50;       // Stop Loss, in pips (1.00045-1.00055=1 pips)
 input int   InpTakeProfit     = 50;       // Take Profit, in pips (1.00045-1.00055=1 pips)
@@ -317,49 +317,49 @@ void OnTick()
      {return;}
 
 //--- buy
- if(BBpattern1)
- {
-   if((adx_main[1]<Inp_ADX_Level && m_symbol.Ask()<bands_lower[1]))
+   if(BBpattern1)
      {
-      double price=m_symbol.Ask();
-      double sl=(InpStopLoss==0)?0.0:price-ExtStopLoss;
-      double tp=(InpTakeProfit==0)?0.0:price+ExtTakeProfit;
-      if(((sl!=0 && ExtStopLoss>=stop_level) || sl==0.0) && ((tp!=0 && ExtTakeProfit>=stop_level) || tp==0.0))
+      if((adx_main[1]<Inp_ADX_Level && m_symbol.Ask()<bands_lower[1]))
         {
-       PosSignalCheck("Signal1");
-      if(!ExistPoss)
-       PosSignalCheck("Signal2");
-      if(!ExistPoss)
-      
-        {
-                           CommentOrder = "Signal1";
-         OpenBuy(sl,tp);
-         if(m_trade.ResultRetcode())
+         double price=m_symbol.Ask();
+         double sl=(InpStopLoss==0)?0.0:price-ExtStopLoss;
+         double tp=(InpTakeProfit==0)?0.0:price+ExtTakeProfit;
+         if(((sl!=0 && ExtStopLoss>=stop_level) || sl==0.0) && ((tp!=0 && ExtTakeProfit>=stop_level) || tp==0.0))
            {
-            PrevBars=0;
-            return;
+            PosSignalCheck("Signal1");
+            if(!ExistPos)
+               PosSignalCheck("Signal2");
+            if(!ExistPos)
+
+              {
+               CommentOrder = "Signal1";
+               OpenBuy(sl,tp);
+               if(m_trade.ResultRetcode())
+                 {
+                  PrevBars=0;
+                  return;
+                 }
+              }
+
+
            }
+         return;
         }
 
-
-        }
-      return;
      }
- 
- }
-        if((BBpattern2Buy))
+   if((BBpattern2Buy))
      {
       double price=m_symbol.Ask();
       double sl=(InpStopLoss==0)?0.0:price-ExtStopLoss;
       double tp=(InpTakeProfit==0)?0.0:price+ExtTakeProfit;
       if(((sl!=0 && ExtStopLoss>=stop_level) || sl==0.0) && ((tp!=0 && ExtTakeProfit>=stop_level) || tp==0.0))
         {
-       PosSignalCheck("Signal3");
-      if(!ExistPoss)
-       PosSignalCheck("Signal4");
-      if(!ExistPoss)
+         PosSignalCheck("Signal3");
+         if(!ExistPos)
+            PosSignalCheck("Signal4");
+         if(!ExistPos)
 
-        CommentOrder = "Signal3";
+            CommentOrder = "Signal3";
          OpenBuy(sl,tp);
          if(m_trade.ResultRetcode())
            {
@@ -372,49 +372,49 @@ void OnTick()
 
 //--- sell
 
- if(BBpattern1)
- {
-if((adx_main[1]<Inp_ADX_Level && m_symbol.Bid()>bands_upper[1]))
+   if(BBpattern1)
      {
-      double price=m_symbol.Bid();
-      double sl=(InpStopLoss==0)?0.0:price+ExtStopLoss;
-      double tp=(InpTakeProfit==0)?0.0:price-ExtTakeProfit;
-      if(((sl!=0 && ExtStopLoss>=stop_level) || sl==0.0) && ((tp!=0 && ExtTakeProfit>=stop_level) || tp==0.0))
+      if((adx_main[1]<Inp_ADX_Level && m_symbol.Bid()>bands_upper[1]))
         {
-        
-      PosSignalCheck("Signal2");
-      if(!ExistPos)
-      PosSignalCheck("Signal1");
-      if(!ExistPos)
-
-{
-        CommentOrder = "Signal2";
-         OpenSell(sl,tp);
-         if(m_trade.ResultRetcode())
+         double price=m_symbol.Bid();
+         double sl=(InpStopLoss==0)?0.0:price+ExtStopLoss;
+         double tp=(InpTakeProfit==0)?0.0:price-ExtTakeProfit;
+         if(((sl!=0 && ExtStopLoss>=stop_level) || sl==0.0) && ((tp!=0 && ExtTakeProfit>=stop_level) || tp==0.0))
            {
-            PrevBars=0;
-            return;
-           }
 
+            PosSignalCheck("Signal2");
+            if(!ExistPos)
+               PosSignalCheck("Signal1");
+            if(!ExistPos)
+
+              {
+               CommentOrder = "Signal2";
+               OpenSell(sl,tp);
+               if(m_trade.ResultRetcode())
+                 {
+                  PrevBars=0;
+                  return;
+                 }
+
+              }
+           }
+         return;
         }
-        }
-      return;
+
      }
- 
- }
-        if((BBpattern2Sell))
+   if((BBpattern2Sell))
      {
       double price=m_symbol.Bid();
       double sl=(InpStopLoss==0)?0.0:price+ExtStopLoss;
       double tp=(InpTakeProfit==0)?0.0:price-ExtTakeProfit;
       if(((sl!=0 && ExtStopLoss>=stop_level) || sl==0.0) && ((tp!=0 && ExtTakeProfit>=stop_level) || tp==0.0))
         {
-      PosSignalCheck("Signal4");
-      if(!ExistPos)
-      PosSignalCheck("Signal3");
-      if(!ExistPos)
+         PosSignalCheck("Signal4");
+         if(!ExistPos)
+            PosSignalCheck("Signal3");
+         if(!ExistPos)
 
-        CommentOrder = "Signal4";
+            CommentOrder = "Signal4";
          OpenSell(sl,tp);
          if(m_trade.ResultRetcode())
            {
@@ -826,3 +826,4 @@ double OnTester()
    param = (balance * trades_number *min_dd)/100 ;
    return(param);
   }
+//+------------------------------------------------------------------+
