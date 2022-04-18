@@ -26,7 +26,8 @@ enum ENUM_LOT_OR_RISK
    risk=1,  // Risk in percent for a deal
   };
 //--- input parameters
-input bool BBpattern2 = false;
+input bool BBpattern1= true;
+input bool BBpattern2 = true
 input int MaxPosition = 1;
 input int   InpStopLoss       = 50;       // Stop Loss, in pips (1.00045-1.00055=1 pips)
 input int   InpTakeProfit     = 50;       // Take Profit, in pips (1.00045-1.00055=1 pips)
@@ -316,6 +317,8 @@ void OnTick()
      {return;}
 
 //--- buy
+ if(BBpattern1)
+ {
    if((adx_main[1]<Inp_ADX_Level && m_symbol.Ask()<bands_lower[1]))
      {
       double price=m_symbol.Ask();
@@ -324,7 +327,10 @@ void OnTick()
       if(((sl!=0 && ExtStopLoss>=stop_level) || sl==0.0) && ((tp!=0 && ExtTakeProfit>=stop_level) || tp==0.0))
         {
        PosSignalCheck("Signal1");
-      if(!ExistPos)
+      if(!ExistPoss)
+       PosSignalCheck("Signal2");
+      if(!ExistPoss)
+      
         {
                            CommentOrder = "Signal1";
          OpenBuy(sl,tp);
@@ -339,6 +345,8 @@ void OnTick()
         }
       return;
      }
+ 
+ }
         if((BBpattern2Buy))
      {
       double price=m_symbol.Ask();
@@ -346,6 +354,11 @@ void OnTick()
       double tp=(InpTakeProfit==0)?0.0:price+ExtTakeProfit;
       if(((sl!=0 && ExtStopLoss>=stop_level) || sl==0.0) && ((tp!=0 && ExtTakeProfit>=stop_level) || tp==0.0))
         {
+       PosSignalCheck("Signal3");
+      if(!ExistPoss)
+       PosSignalCheck("Signal4");
+      if(!ExistPoss)
+
         CommentOrder = "Signal3";
          OpenBuy(sl,tp);
          if(m_trade.ResultRetcode())
@@ -358,7 +371,10 @@ void OnTick()
      }
 
 //--- sell
-   if((adx_main[1]<Inp_ADX_Level && m_symbol.Bid()>bands_upper[1]))
+
+ if(BBpattern1)
+ {
+if((adx_main[1]<Inp_ADX_Level && m_symbol.Bid()>bands_upper[1]))
      {
       double price=m_symbol.Bid();
       double sl=(InpStopLoss==0)?0.0:price+ExtStopLoss;
@@ -366,9 +382,12 @@ void OnTick()
       if(((sl!=0 && ExtStopLoss>=stop_level) || sl==0.0) && ((tp!=0 && ExtTakeProfit>=stop_level) || tp==0.0))
         {
         
-               PosSignalCheck("Signal2");
+      PosSignalCheck("Signal2");
       if(!ExistPos)
-        {
+      PosSignalCheck("Signal1");
+      if(!ExistPos)
+
+{
         CommentOrder = "Signal2";
          OpenSell(sl,tp);
          if(m_trade.ResultRetcode())
@@ -381,6 +400,8 @@ void OnTick()
         }
       return;
      }
+ 
+ }
         if((BBpattern2Sell))
      {
       double price=m_symbol.Bid();
@@ -388,6 +409,11 @@ void OnTick()
       double tp=(InpTakeProfit==0)?0.0:price-ExtTakeProfit;
       if(((sl!=0 && ExtStopLoss>=stop_level) || sl==0.0) && ((tp!=0 && ExtTakeProfit>=stop_level) || tp==0.0))
         {
+      PosSignalCheck("Signal4");
+      if(!ExistPos)
+      PosSignalCheck("Signal3");
+      if(!ExistPos)
+
         CommentOrder = "Signal4";
          OpenSell(sl,tp);
          if(m_trade.ResultRetcode())
