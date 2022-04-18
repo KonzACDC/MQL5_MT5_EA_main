@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
-//|                                                         BADX.mq5 |
-//|                              Copyright © 2018, Vladimir Karputov |
+//|                                                     BADX_wip.mq5 |
+//|         Copyright © 2018-2022, Vladimir Karputov Remixed by Konz |
 //|                                           http://wmua.ru/slesar/ |
 //+------------------------------------------------------------------+
-#property copyright "Copyright © 2018, Vladimir Karputov"
+#property copyright "Copyright © 2018-2022, Vladimir Karputov Remixed by Konz"
 #property link      "http://wmua.ru/slesar/"
-#property version   "1.000"
+#property version   "1.5"
 //---
 #include <Trade\PositionInfo.mqh>
 #include <Trade\Trade.mqh>
