@@ -1,12 +1,3 @@
-//+------------------------------------------------------------------+
-//|                                                     BADX_wip.mq5 |
-//|         Copyright © 2018-2022, Vladimir Karputov Remixed by Konz |
-//|                                           http://wmua.ru/slesar/ |
-//+------------------------------------------------------------------+
-#property copyright "Copyright © 2018-2022, Vladimir Karputov Remixed by Konz"
-#property link      "http://wmua.ru/slesar/"
-#property version   "1.5"
-//---
 #include <Trade\PositionInfo.mqh>
 #include <Trade\Trade.mqh>
 #include <Trade\SymbolInfo.mqh>
@@ -29,10 +20,10 @@ enum ENUM_LOT_OR_RISK
 input bool BBpattern1= true;
 input bool BBpattern2 = true;
 input int MaxPosition = 1;
-input int   InpStopLoss       = 50;       // Stop Loss, in pips (1.00045-1.00055=1 pips)
-input int   InpTakeProfit     = 50;       // Take Profit, in pips (1.00045-1.00055=1 pips)
-input int   InpTrailingStop   = 5;        // Trailing Stop (min distance from price to Stop Loss, in pips
-input int   InpTrailingStep   = 5;        // Trailing Step, in pips (1.00045-1.00055=1 pips)
+input int   InpStopLoss       = 50;       // Stop Loss
+input int   InpTakeProfit     = 50;       // Take Profit
+input int   InpTrailingStop   = 5;        // Trailing Stop 
+input int   InpTrailingStep   = 5;        // Trailing Step
 input ENUM_LOT_OR_RISK IntLotOrRisk=lot;     // Money management: Lot OR Risk
 input double   InpVolumeLorOrRisk=1.0;       // The value for "Money management"
 input int      Inp_ADX_adx_period=30;        // ADX: averaging period
