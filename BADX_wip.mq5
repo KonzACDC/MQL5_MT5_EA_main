@@ -53,13 +53,13 @@ double ExtTrailingStep=0.0;
 int    handle_iADX;                    // variable for storing the handle of the iADX indicator
 int    handle_iBands;                  // variable for storing the handle of the iBands indicator
 double m_adjusted_point;               // point value adjusted for 3 or 5 points
-int BBHandle3;                         // ????? ?????????? Bolinger Bands
+int BBHandle3;                         // Bolinger Bands
 
-int ADXHandle3;                        // ????? ?????????? ADX
+int ADXHandle3;                        // ADX
 
-double BBUp3[],BBLow3[],MiddleBandArray3[];                // ???????????? ??????? ??? ???????? ????????? ???????? Bollinger Bands
+double BBUp3[],BBLow3[],MiddleBandArray3[];                // Bollinger Bands
 
-double ADX3[];                         // ???????????? ??????? ??? ???????? ????????? ???????? ADX
+double ADX3[];                         // ADX
 double close3[];
 bool BBpattern2Buy = false;
 bool BBpattern2Sell = false;
@@ -211,16 +211,14 @@ void OnTick()
    ArraySetAsSeries(ADX3,true);
    ArraySetAsSeries(MiddleBandArray3,true);
    ArraySetAsSeries(close3,true);
-//--- ???????? ???????? ?????????? Bolinger Bands ????????? ??????
    if(CopyBuffer(BBHandle3,1,0,3,BBUp3)<0 || CopyBuffer(BBHandle3,2,0,3,BBLow3)<0)
      {
-      Alert("?????? ??????????? ??????? ?????????? Bollinger Bands - ????? ??????:",GetLastError(),"!");
+      Alert("Bollinger Bands:",GetLastError(),"!");
       return;
      }
-//--- ???????? ???????? ?????????? ADX ????????? ??????
    if(CopyBuffer(ADXHandle3,0,0,3,ADX3)<0)
      {
-      Alert("?????? ??????????? ??????? ?????????? ADX - ????? ??????:",GetLastError(),"!");
+      Alert("ADX:",GetLastError(),"!");
       return;
      }
    CopyBuffer(BBHandle3,0,0,3,MiddleBandArray3);
@@ -264,18 +262,18 @@ void OnTick()
       Type of order/position  |  Activation price  |  Check
       ------------------------|--------------------|--------------------------------------------
       Buy Limit order         |  Ask               |  Ask-OpenPrice  >= SYMBOL_TRADE_FREEZE_LEVEL
-      Buy Stop order          |  Ask             |  OpenPrice-Ask  >= SYMBOL_TRADE_FREEZE_LEVEL
-      Sell Limit order        |  Bid             |  OpenPrice-Bid  >= SYMBOL_TRADE_FREEZE_LEVEL
-      Sell Stop order       |  Bid             |  Bid-OpenPrice  >= SYMBOL_TRADE_FREEZE_LEVEL
-      Buy position            |  Bid             |  TakeProfit-Bid >= SYMBOL_TRADE_FREEZE_LEVEL
+      Buy Stop order          |  Ask               |  OpenPrice-Ask  >= SYMBOL_TRADE_FREEZE_LEVEL
+      Sell Limit order        |  Bid               |  OpenPrice-Bid  >= SYMBOL_TRADE_FREEZE_LEVEL
+      Sell Stop order         |  Bid               |  Bid-OpenPrice  >= SYMBOL_TRADE_FREEZE_LEVEL
+      Buy position            |  Bid               |  TakeProfit-Bid >= SYMBOL_TRADE_FREEZE_LEVEL
                               |                    |  Bid-StopLoss   >= SYMBOL_TRADE_FREEZE_LEVEL
-      Sell position           |  Ask             |  Ask-TakeProfit >= SYMBOL_TRADE_FREEZE_LEVEL
+      Sell position           |  Ask               |  Ask-TakeProfit >= SYMBOL_TRADE_FREEZE_LEVEL
                               |                    |  StopLoss-Ask   >= SYMBOL_TRADE_FREEZE_LEVEL
 
       Buying is done at the Ask price                 |  Selling is done at the Bid price
       ------------------------------------------------|----------------------------------
       TakeProfit        >= Bid                        |  TakeProfit        <= Ask
-      StopLoss          <= Bid                      |  StopLoss          >= Ask
+      StopLoss          <= Bid                        |  StopLoss          >= Ask
       TakeProfit - Bid  >= SYMBOL_TRADE_STOPS_LEVEL   |  Ask - TakeProfit  >= SYMBOL_TRADE_STOPS_LEVEL
       Bid - StopLoss    >= SYMBOL_TRADE_STOPS_LEVEL   |  StopLoss - Ask    >= SYMBOL_TRADE_STOPS_LEVEL
    */
@@ -454,20 +452,14 @@ bool CheckVolumeValue(double volume,string &error_description)
    double min_volume=m_symbol.LotsMin();
    if(volume<min_volume)
      {
-      if(TerminalInfoString(TERMINAL_LANGUAGE)=="Russian")
-         error_description=StringFormat("Объем меньше минимально допустимого SYMBOL_VOLUME_MIN=%.2f",min_volume);
-      else
-         error_description=StringFormat("Volume is less than the minimal allowed SYMBOL_VOLUME_MIN=%.2f",min_volume);
+     error_description=StringFormat("Volume is less than the minimal allowed SYMBOL_VOLUME_MIN=%.2f",min_volume);
       return(false);
      }
 //--- maximal allowed volume of trade operations
    double max_volume=m_symbol.LotsMax();
    if(volume>max_volume)
-     {
-      if(TerminalInfoString(TERMINAL_LANGUAGE)=="Russian")
-         error_description=StringFormat("Объем больше максимально допустимого SYMBOL_VOLUME_MAX=%.2f",max_volume);
-      else
-         error_description=StringFormat("Volume is greater than the maximal allowed SYMBOL_VOLUME_MAX=%.2f",max_volume);
+     {  
+      error_description=StringFormat("Volume is greater than the maximal allowed SYMBOL_VOLUME_MAX=%.2f",max_volume);
       return(false);
      }
 //--- get minimal step of volume changing
@@ -475,11 +467,7 @@ bool CheckVolumeValue(double volume,string &error_description)
    int ratio=(int)MathRound(volume/volume_step);
    if(MathAbs(ratio*volume_step-volume)>0.0000001)
      {
-      if(TerminalInfoString(TERMINAL_LANGUAGE)=="Russian")
-         error_description=StringFormat("Объем не кратен минимальному шагу SYMBOL_VOLUME_STEP=%.2f, ближайший правильный объем %.2f",
-                                        volume_step,ratio*volume_step);
-      else
-         error_description=StringFormat("Volume is not a multiple of the minimal step SYMBOL_VOLUME_STEP=%.2f, the closest correct volume is %.2f",
+       error_description=StringFormat("Volume is not a multiple of the minimal step SYMBOL_VOLUME_STEP=%.2f, the closest correct volume is %.2f",
                                         volume_step,ratio*volume_step);
       return(false);
      }
