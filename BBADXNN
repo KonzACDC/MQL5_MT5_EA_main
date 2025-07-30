@@ -14,37 +14,35 @@
 input group "Risk Management"
 input double ATR_Multiplier = 2.0;          // SL用変動幅乗数
 input double TP_ATR_Multiplier = 3.0;       // TP用変動幅乗数
-input double FixedLotSize = 0.1;            // 固定ロットサイズ
+input double RiskPercent = 1.0;             // リスク率（%）
 
 input group "Trading Symbols"
 input string Symbol1 = "EURUSD";            // 通貨ペア1
 input string Symbol2 = "GBPUSD";            // 通貨ペア2
 input string Symbol3 = "USDJPY";            // 通貨ペア3
 
-input group "Bollinger Bands Parameters"
-input int BB_Period = 20;                   // ボリンジャーバンド期間
-input double BB_Deviation = 2.0;            // 標準偏差倍率
-
-input group "ADX Parameters"
-input int ADX_Period = 14;                  // ADX期間
-
 input group "Neural Network Parameters"
-input double w1_0_0 = 0.1, w1_0_1 = 0.2, w1_0_2 = 0.3; 
+// 入力層→隠れ層の重み (3入力×3ノード)
+input double w1_0_0 = 0.1, w1_0_1 = 0.2, w1_0_2 = 0.3;
 input double w1_1_0 = 0.1, w1_1_1 = 0.2, w1_1_2 = 0.3;
 input double w1_2_0 = 0.1, w1_2_1 = 0.2, w1_2_2 = 0.3;
-input double b1_0 = 0.1, b1_1 = 0.2, b1_2 = 0.3;   
-input double w2_0_0 = 0.1, w2_0_1 = 0.2;   
-input double w2_1_0 = 0.1, w2_1_1 = 0.2;
-input double w2_2_0 = 0.1, w2_2_1 = 0.2;
-input double b2_0 = 0.1, b2_1 = 0.2;        
-input double w3_0_0 = 0.1, w3_1_0 = 0.2;   
-input double b3 = 0.1;                      
 
+// 隠れ層のバイアス (3ノード)
+input double b1_0 = 0.1, b1_1 = 0.2, b1_2 = 0.3;
+
+// 隠れ層→出力層の重み (3ノード×1出力)
+input double w2_0 = 0.1, w2_1 = 0.2, w2_2 = 0.3;
+
+// 出力層のバイアス
+input double b2 = 0.1;
 //+------------------------------------------------------------------+
 //| グローバル変数                                                  |
 //+------------------------------------------------------------------+
 datetime lastBarTime[3];                     // 各通貨の最終バー時間
-int bbHandles[3], adxHandles[3];             // インジケーターハンドル
+int rsiHandles[3];                          // RSIインジケーターハンドル
+int atrHandles[3];                           // ATRインジケーターハンドル
+int emaShortHandles[3];                      // 短期EMAハンドル
+int emaLongHandles[3];                       // 長期EMAハンドル
 
 // ポジション管理構造体
 struct PositionData {
@@ -93,8 +91,10 @@ bool IsInitializationValid()
       string symbol = GetSymbolByIndex(i);
       if(symbol == "") continue;
       
-      if(bbHandles[i] == INVALID_HANDLE || 
-         adxHandles[i] == INVALID_HANDLE) 
+      if(rsiHandles[i] == INVALID_HANDLE || 
+         atrHandles[i] == INVALID_HANDLE ||
+         emaShortHandles[i] == INVALID_HANDLE ||
+         emaLongHandles[i] == INVALID_HANDLE) 
       {
          Print("Error: Indicator initialization failed for ", symbol);
          return false;
@@ -111,13 +111,18 @@ void InitializeSymbol(string symbol, int index)
    // シンボル有効性チェック
    if(symbol == "" || !SymbolInfoInteger(symbol, SYMBOL_SELECT)) {
       Print("Warning: Invalid symbol - ", symbol);
-      bbHandles[index] = -1;
+      rsiHandles[index] = INVALID_HANDLE;
+      atrHandles[index] = INVALID_HANDLE;
+      emaShortHandles[index] = INVALID_HANDLE;
+      emaLongHandles[index] = INVALID_HANDLE;
       return;
    }
    
    // インジケーター初期化（確定足ベース）
-   bbHandles[index] = iBands(symbol, _Period, BB_Period, 0, BB_Deviation, PRICE_CLOSE);
-   adxHandles[index] = iADX(symbol, _Period, ADX_Period);
+   rsiHandles[index] = iRSI(symbol, _Period, 14, PRICE_CLOSE);
+   atrHandles[index] = iATR(symbol, _Period, 14);
+   emaShortHandles[index] = iMA(symbol, _Period, 12, 0, MODE_EMA, PRICE_CLOSE);
+   emaLongHandles[index] = iMA(symbol, _Period, 26, 0, MODE_EMA, PRICE_CLOSE);
 }
 
 //+------------------------------------------------------------------+
@@ -127,80 +132,65 @@ void OnDeinit(const int reason)
 {
    // インジケーターリソース解放
    for(int i = 0; i < 3; i++) {
-      if(bbHandles[i] != INVALID_HANDLE) IndicatorRelease(bbHandles[i]);
-      if(adxHandles[i] != INVALID_HANDLE) IndicatorRelease(adxHandles[i]);
+      if(rsiHandles[i] != INVALID_HANDLE) IndicatorRelease(rsiHandles[i]);
+      if(atrHandles[i] != INVALID_HANDLE) IndicatorRelease(atrHandles[i]);
+      if(emaShortHandles[i] != INVALID_HANDLE) IndicatorRelease(emaShortHandles[i]);
+      if(emaLongHandles[i] != INVALID_HANDLE) IndicatorRelease(emaLongHandles[i]);
    }
 }
 
 //+------------------------------------------------------------------+
-//| 入力データ準備（ボリンジャーバンドとADX）                        |
+//| 入力データ準備（RSI, ATR変化率, EMA乖離率）                     |
 //+------------------------------------------------------------------+
 void PrepareInputData(string symbol, int symbolIndex, double &inputs[])
 {
    ArrayResize(inputs, 3);
    
-   // [0] ボリンジャーバンド幅の正規化値（確定足を使用）
-   double bbUpper[1], bbLower[1];
-   if(CopyBuffer(bbHandles[symbolIndex], 1, 1, 1, bbUpper) == 1 &&
-      CopyBuffer(bbHandles[symbolIndex], 2, 1, 1, bbLower) == 1) 
-   {
-      double bandWidth = bbUpper[0] - bbLower[0];
-      
-      // バンド幅の正規化（移動平均ベース） - 修正部分
-      double bbUpperArray[], bbLowerArray[];
-      int copied = CopyBuffer(bbHandles[symbolIndex], 1, 1, BB_Period, bbUpperArray);
-      int copied2 = CopyBuffer(bbHandles[symbolIndex], 2, 1, BB_Period, bbLowerArray);
-      
-      if(copied == BB_Period && copied2 == BB_Period)
-      {
-         double avgWidth = 0;
-         for(int i = 0; i < BB_Period; i++) {
-            avgWidth += (bbUpperArray[i] - bbLowerArray[i]);
-         }
-         avgWidth /= BB_Period;
-         
-         // バンド幅の変動を正規化（0.5-1.5 → -1.0 to 1.0）
-         double ratio = bandWidth / MathMax(avgWidth, 0.0001);
-         inputs[0] = (MathMin(MathMax(ratio, 0.5), 1.5) - 1.0) * 2.0; 
-      }
-      else 
-      {
-         inputs[0] = 0;
-         Print("Failed to get Bollinger Bands history for ", symbol);
-      }
-   } 
-   else 
-   {
+   // [0] RSI(14) 正規化値（確定足）
+   double rsi[1];
+   if(CopyBuffer(rsiHandles[symbolIndex], 0, 1, 1, rsi) == 1) {
+      // RSIを0～100 → -1.0～1.0に正規化 (50を0とする)
+      inputs[0] = (rsi[0] - 50.0) / 50.0;
+   } else {
       inputs[0] = 0;
-      Print("Failed to get current Bollinger Bands data for ", symbol);
+      Print("Failed to get RSI data for ", symbol);
    }
    
-   // [1] 価格位置の正規化値（確定足の終値を使用）
-   double close = iClose(symbol, _Period, 1);
-   if(CopyBuffer(bbHandles[symbolIndex], 1, 1, 1, bbUpper) == 1 &&
-      CopyBuffer(bbHandles[symbolIndex], 2, 1, 1, bbLower) == 1) 
-   {
-      double bandRange = bbUpper[0] - bbLower[0];
-      if(bandRange > 0) {
-         // バンド内での位置を-1.0～1.0に正規化（下限=-1, 上限=1）
-         inputs[1] = ((close - bbLower[0]) / bandRange - 0.5) * 2.0; 
+   // [1] ATR変化率（前値との変化率）
+   double atr[2];
+   if(CopyBuffer(atrHandles[symbolIndex], 0, 1, 2, atr) == 2) {
+      if(atr[1] > 0) { // 前のATRが0より大きい場合
+         double changeRate = (atr[0] - atr[1]) / atr[1];
+         // 変化率を-0.5～0.5の範囲にクリップしてから-1.0～1.0に正規化
+         double clipped = MathMin(MathMax(changeRate, -0.5), 0.5);
+         inputs[1] = clipped * 2.0;
       } else {
-         inputs[1] = 0;
+         inputs[1] = 0; // 前のATRが0の場合は0
       }
    } else {
       inputs[1] = 0;
+      Print("Failed to get ATR data for ", symbol);
    }
    
-   // [2] ADX正規化値（確定足を使用）
-   double adx[1];
-   if(CopyBuffer(adxHandles[symbolIndex], 0, 1, 1, adx) == 1) {
-      // ADX値を0～100→-1.0～1.0に正規化（25以下=-1, 50以上=1）
-      inputs[2] = MathMin(MathMax(adx[0], 0.0), 100.0) / 50.0 - 1.0; 
+   // [2] EMA短長乖離率（短期EMA(12)と長期EMA(26)）
+   double emaShort[1], emaLong[1];
+   if(CopyBuffer(emaShortHandles[symbolIndex], 0, 1, 1, emaShort) == 1 &&
+      CopyBuffer(emaLongHandles[symbolIndex], 0, 1, 1, emaLong) == 1) 
+   {
+      if(emaLong[0] > 0) {
+         double deviation = (emaShort[0] - emaLong[0]) / emaLong[0];
+         // 乖離率を-0.1～0.1の範囲にクリップしてから-1.0～1.0に正規化
+         double clipped = MathMin(MathMax(deviation, -0.1), 0.1);
+         inputs[2] = clipped * 10.0;
+      } else {
+         inputs[2] = 0; // 長期EMAが0の場合は0
+      }
    } else {
       inputs[2] = 0;
-      Print("Failed to get ADX data for ", symbol);
+      Print("Failed to get EMA data for ", symbol);
    }
 }
+
 //+------------------------------------------------------------------+
 //| Expert tick function                                             |
 //+------------------------------------------------------------------+
@@ -212,7 +202,7 @@ void OnTick()
    // 各通貨ペアの新しいバーをチェック
    for(int i = 0; i < 3; i++) {
       string symbol = GetSymbolByIndex(i);
-      if(symbol == "" || bbHandles[i] == INVALID_HANDLE) continue;
+      if(symbol == "" || rsiHandles[i] == INVALID_HANDLE) continue;
       
       CheckNewBar(symbol, lastBarTime[i], i);
    }
@@ -236,7 +226,7 @@ void SyncPositionData()
             positionInfo[i].entryTime = (datetime)PositionGetInteger(POSITION_TIME);
             
             // SL/TP再計算
-            double range = GetAverageRange(symbol);
+            double range = GetAverageRange(symbol, GetSymbolIndex(symbol)); // シンボルインデックスを取得
             if(range > 0) {
                if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
                   positionInfo[i].slPrice = positionInfo[i].entryPrice - range * ATR_Multiplier;
@@ -286,53 +276,47 @@ void ProcessTrading(string symbol, int symbolIndex)
 }
 
 //+------------------------------------------------------------------+
-//| 平均変動幅取得（高値-安値ベース、確定足を使用）                  |
+//| 平均変動幅取得（ATRを使用）                                      |
 //+------------------------------------------------------------------+
-double GetAverageRange(string symbol)
+double GetAverageRange(string symbol, int symbolIndex)
 {
-   double sumRange = 0.0;
-   int periods = 14; // ATRと同じ期間
-   
-   for(int i = 1; i <= periods; i++) {
-      double high = iHigh(symbol, _Period, i);
-      double low = iLow(symbol, _Period, i);
-      sumRange += (high - low); // 高値-安値の変動幅を加算
+   double atr[1];
+   if(CopyBuffer(atrHandles[symbolIndex], 0, 1, 1, atr) == 1) {
+      return atr[0];
    }
-   
-   return (sumRange / periods);
+   Print("Error: Failed to get ATR value for ", symbol);
+   return 0;
 }
 
 //+------------------------------------------------------------------+
-//| ニューラルネットワーク                                           |
+//| Leaky ReLU関数                                                   |
+//+------------------------------------------------------------------+
+double leakyRelu(double x) {
+   return (x > 0) ? x : 0.01 * x;
+}
+
+//+------------------------------------------------------------------+
+//| ニューラルネットワーク (3-3-1構造)                              |
 //+------------------------------------------------------------------+
 double NeuralNetwork(double &inputs[])
 {
-   // 隠れ層1の計算
+   // 隠れ層の計算 (3ユニット)
    double h1[3];
    h1[0] = inputs[0]*w1_0_0 + inputs[1]*w1_1_0 + inputs[2]*w1_2_0 + b1_0;
    h1[1] = inputs[0]*w1_0_1 + inputs[1]*w1_1_1 + inputs[2]*w1_2_1 + b1_1;
-   h1[2] = inputs[0]*w1_0_2 + inputs[1]*w1_1_2 + inputs[2]*w1_2_2 + b1_2;   
-   // ReLU活性化関数
-   h1[0] = MathMax(h1[0], 0);
-   h1[1] = MathMax(h1[1], 0);
-   h1[2] = MathMax(h1[2], 0);
+   h1[2] = inputs[0]*w1_0_2 + inputs[1]*w1_1_2 + inputs[2]*w1_2_2 + b1_2;
    
-   // 隠れ層2の計算
-   double h2[2];
-   h2[0] = h1[0]*w2_0_0 + h1[1]*w2_1_0 + h1[2]*w2_2_0 + b2_0;
-   h2[1] = h1[0]*w2_0_1 + h1[1]*w2_1_1 + h1[2]*w2_2_1 + b2_1;
-   
-   // ReLU活性化関数
-   h2[0] = MathMax(h2[0], 0);
-   h2[1] = MathMax(h2[1], 0);
+   // Leaky ReLU活性化関数
+   for(int i=0; i<3; i++) {
+      h1[i] = leakyRelu(h1[i]);
+   }
    
    // 出力層の計算
-   double output = h2[0]*w3_0_0 + h2[1]*w3_1_0 + b3;
+   double output = h1[0]*w2_0 + h1[1]*w2_1 + h1[2]*w2_2 + b2;
    
    // シグモイド活性化関数
    return 1.0 / (1.0 + MathExp(-output));
 }
-
 //+------------------------------------------------------------------+
 //| 取引実行                                                        |
 //+------------------------------------------------------------------+
@@ -349,7 +333,7 @@ void ExecuteTrade(string symbol, int symbolIndex, double prediction)
       // 売りポジションがあれば決済
       if(currentPos < 0) ClosePosition(symbol);
       
-      double range = GetAverageRange(symbol);
+      double range = GetAverageRange(symbol, symbolIndex); // シンボルインデックスを渡す
       if(range <= 0) return;
       
       double lot = CalculateLotSize(symbol, range);
@@ -375,7 +359,7 @@ void ExecuteTrade(string symbol, int symbolIndex, double prediction)
       // 買いポジションがあれば決済
       if(currentPos > 0) ClosePosition(symbol);
       
-      double range = GetAverageRange(symbol);
+      double range = GetAverageRange(symbol, symbolIndex); // シンボルインデックスを渡す
       if(range <= 0) return;
       
       double lot = CalculateLotSize(symbol, range);
@@ -399,12 +383,36 @@ void ExecuteTrade(string symbol, int symbolIndex, double prediction)
 }
 
 //+------------------------------------------------------------------+
-//| ロットサイズ計算                                                |
+//| ボラティリティ適応型ロットサイズ計算                             |
 //+------------------------------------------------------------------+
 double CalculateLotSize(string symbol, double range)
 {
-   // 固定ロットサイズ
-   double lot = FixedLotSize;
+   // リスク管理：ボラティリティ適応型
+   double slDistance = range * ATR_Multiplier;
+   double slPoints = slDistance / SymbolInfoDouble(symbol, SYMBOL_POINT);
+   
+   // 1ポイントあたりの価値（1ロット当たり）を計算
+   double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   
+   // 計算の安全チェック
+   if(tickSize <= 0 || point <= 0) {
+      Print("Error: Invalid tickSize or point for ", symbol);
+      return 0;
+   }
+   
+   double valuePerPoint = tickValue / (tickSize / point);
+   if(valuePerPoint <= 0) {
+      Print("Error: Invalid valuePerPoint for ", symbol);
+      return 0;
+   }
+   
+   // リスク額計算（口座残高の%）
+   double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0;
+   
+   // ロットサイズ計算
+   double lot = riskMoney / (slPoints * valuePerPoint);
    
    // ロットサイズの最小・最大値チェック
    double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
