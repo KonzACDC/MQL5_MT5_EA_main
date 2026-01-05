@@ -1,0 +1,789 @@
+//+------------------------------------------------------------------+
+//|                     NeuralNetworkEA.mq5                          |
+//|                        Version 3.1                              |
+//|        改修版: 2つの入力特徴量(rとvol)を使用したニューラルネットワーク戦略 |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2023, MetaQuotes Ltd."
+#property link      "https://www.metaquotes.net/"
+#property version   "3.1"
+#property strict
+
+//+------------------------------------------------------------------+
+//| 入力パラメータ                                                  |
+//+------------------------------------------------------------------+
+input group "Risk Management"
+input double ATR_Multiplier = 2.0;          // SL用変動幅乗数
+input double TP_ATR_Multiplier = 3.0;       // TP用変動幅乗数
+input double RiskPercent = 1.0;             // リスク率（%）
+
+input group "Trading Symbols"
+input string Symbol1 = "EURUSD";            // 通貨ペア1
+input string Symbol2 = "GBPUSD";            // 通貨ペア2
+input string Symbol3 = "USDJPY";            // 通貨ペア3
+
+input group "Feature Parameters"
+input int r_Period = 14;                    // r計算用の期間(n)
+input int ATR_Short_Period = 7;             // 短期ATR期間
+input int ATR_Long_Period = 21;             // 長期ATR期間
+
+input group "Neural Network Parameters"
+// 入力層→隠れ層の重み (2入力×3ノード)
+input double w1_0_0 = 0.1, w1_0_1 = 0.2, w1_0_2 = 0.3;
+input double w1_1_0 = -0.1, w1_1_1 = -0.2, w1_1_2 = -0.3;
+
+// 隠れ層のバイアス (3ノード)
+input double b1_0 = 0.1, b1_1 = 0.2, b1_2 = 0.3;
+
+// 隠れ層→出力層の重み (3ノード×1出力)
+input double w2_0 = 0.1, w2_1 = 0.2, w2_2 = 0.3;
+
+// 出力層のバイアス
+input double b2 = 0.1;
+
+//+------------------------------------------------------------------+
+//| グローバル変数                                                  |
+//+------------------------------------------------------------------+
+datetime lastBarTime[3];                     // 各通貨の最終バー時間
+int atrHandles[3];                           // ATRインジケーターハンドル (r計算用)
+int atrShortHandles[3];                      // 短期ATRインジケーターハンドル
+int atrLongHandles[3];                       // 長期ATRインジケーターハンドル
+
+// ポジション管理構造体
+struct PositionData {
+   double slPrice;     // ストップロス価格（内部管理）
+   double tpPrice;     // テイクプロフィット価格（内部管理）
+   double entryPrice;  // エントリー価格
+   datetime entryTime; // エントリー時間
+   ulong ticket;       // ポジションチケットID
+};
+PositionData positionInfo[3]; // 各通貨ごとのポジションデータ
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   // パラメータの妥当性チェック
+   if(r_Period <= 0 || ATR_Short_Period <= 0 || ATR_Long_Period <= 0) {
+      Print("Error: Period parameters must be greater than 0");
+      return INIT_FAILED;
+   }
+   
+   if(ATR_Short_Period >= ATR_Long_Period) {
+      Print("Error: ATR_Short_Period must be less than ATR_Long_Period");
+      return INIT_FAILED;
+   }
+   
+   // ポジションデータ初期化
+   for(int i = 0; i < 3; i++) {
+      positionInfo[i].slPrice = 0;
+      positionInfo[i].tpPrice = 0;
+      positionInfo[i].entryPrice = 0;
+      positionInfo[i].entryTime = 0;
+      positionInfo[i].ticket = 0;
+      lastBarTime[i] = 0;
+   }
+   
+   // 通貨ペア初期化
+   InitializeSymbol(Symbol1, 0);
+   InitializeSymbol(Symbol2, 1);
+   InitializeSymbol(Symbol3, 2);
+   
+   // 初期化チェック
+   if(!IsInitializationValid()) {
+      return INIT_FAILED;
+   }
+   
+   Print("EA initialized successfully with 2 input features: r and vol");
+   Print("r = (Close[0] - Close[", r_Period, "]) / ATR(", r_Period, ")");
+   Print("vol = ATR(", ATR_Short_Period, ") / ATR(", ATR_Long_Period, ")");
+   
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| 初期化検証                                                      |
+//+------------------------------------------------------------------+
+bool IsInitializationValid()
+{
+   for(int i = 0; i < 3; i++) {
+      string symbol = GetSymbolByIndex(i);
+      if(symbol == "") continue;
+      
+      if(atrHandles[i] == INVALID_HANDLE || 
+         atrShortHandles[i] == INVALID_HANDLE ||
+         atrLongHandles[i] == INVALID_HANDLE) 
+      {
+         Print("Error: Indicator initialization failed for ", symbol);
+         return false;
+      }
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| 通貨ペア初期化                                                  |
+//+------------------------------------------------------------------+
+void InitializeSymbol(string symbol, int index)
+{
+   // シンボル有効性チェック
+   if(symbol == "" || !SymbolInfoInteger(symbol, SYMBOL_SELECT)) {
+      Print("Warning: Invalid symbol - ", symbol);
+      atrHandles[index] = INVALID_HANDLE;
+      atrShortHandles[index] = INVALID_HANDLE;
+      atrLongHandles[index] = INVALID_HANDLE;
+      return;
+   }
+   
+   // インジケーター初期化
+   atrHandles[index] = iATR(symbol, _Period, r_Period);           // r計算用ATR
+   atrShortHandles[index] = iATR(symbol, _Period, ATR_Short_Period); // 短期ATR
+   atrLongHandles[index] = iATR(symbol, _Period, ATR_Long_Period);   // 長期ATR
+   
+   Print("Initialized indicators for ", symbol, 
+         ": ATR(", r_Period, "), ATR(", ATR_Short_Period, "), ATR(", ATR_Long_Period, ")");
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   // インジケーターリソース解放
+   for(int i = 0; i < 3; i++) {
+      if(atrHandles[i] != INVALID_HANDLE) IndicatorRelease(atrHandles[i]);
+      if(atrShortHandles[i] != INVALID_HANDLE) IndicatorRelease(atrShortHandles[i]);
+      if(atrLongHandles[i] != INVALID_HANDLE) IndicatorRelease(atrLongHandles[i]);
+   }
+   Print("EA deinitialized");
+}
+
+//+------------------------------------------------------------------+
+//| 入力データ準備（特徴量rとvol）                                  |
+//+------------------------------------------------------------------+
+void PrepareInputData(string symbol, int symbolIndex, double &inputs[])
+{
+   ArrayResize(inputs, 2); // 入力特徴量は2つ
+   
+   // 特徴量1: r = (Close[0] - Close[n]) / ATR(n)
+   double r = CalculateR(symbol, symbolIndex);
+   inputs[0] = r;
+   
+   // 特徴量2: vol = ATR(short) / ATR(long)
+   double vol = CalculateVolatilityRatio(symbol, symbolIndex);
+   inputs[1] = vol;
+   
+   // デバッグ用: 特徴量の値を表示
+   if(MathRand() % 100 == 0) { // 1%の確率で表示（ログが多くなりすぎないように）
+      Print(symbol, " - r: ", DoubleToString(r, 4), ", vol: ", DoubleToString(vol, 4));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 特徴量rの計算: (Close[0] - Close[n]) / ATR(n)                   |
+//+------------------------------------------------------------------+
+double CalculateR(string symbol, int symbolIndex)
+{
+   // 現在の終値とn期間前の終値を取得
+   double closeCurrent = iClose(symbol, _Period, 0);
+   double closePrevious = iClose(symbol, _Period, r_Period);
+   
+   // ATR(n)の値を取得
+   double atr[1];
+   if(CopyBuffer(atrHandles[symbolIndex], 0, 1, 1, atr) == 1 && atr[0] > 0) {
+      // r = (現在の終値 - n期間前の終値) / ATR(n)
+      double r = (closeCurrent - closePrevious) / atr[0];
+      
+      // 外れ値をクリップして正規化（-3.0～3.0の範囲に）
+      r = MathMin(MathMax(r, -3.0), 3.0);
+      
+      // -1.0～1.0の範囲に正規化
+      return r / 3.0;
+   }
+   
+   // エラー時は0を返す
+   return 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| 特徴量volの計算: ATR(short) / ATR(long)                         |
+//+------------------------------------------------------------------+
+double CalculateVolatilityRatio(string symbol, int symbolIndex)
+{
+   double atrShort[1], atrLong[1];
+   
+   // 短期ATRと長期ATRを取得
+   if(CopyBuffer(atrShortHandles[symbolIndex], 0, 1, 1, atrShort) == 1 &&
+      CopyBuffer(atrLongHandles[symbolIndex], 0, 1, 1, atrLong) == 1) 
+   {
+      if(atrLong[0] > 0) {
+         // vol = ATR(short) / ATR(long)
+         double vol = atrShort[0] / atrLong[0];
+         
+         // ボラティリティ比率の典型的な範囲は0.5～2.0
+         // 0.5～2.0の範囲にクリップしてから正規化
+         vol = MathMin(MathMax(vol, 0.5), 2.0);
+         
+         // 0.5→-1.0, 1.0→0.0, 2.0→1.0となるように線形変換
+         return (vol - 1.0) / 0.75; // 調整係数
+      }
+   }
+   
+   // エラー時は0を返す
+   return 0.0;
+}
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   // ポジション情報をリアルタイムで同期
+   SyncPositionData();
+   
+   // 各通貨ペアの新しいバーをチェック
+   for(int i = 0; i < 3; i++) {
+      string symbol = GetSymbolByIndex(i);
+      if(symbol == "" || atrHandles[i] == INVALID_HANDLE) continue;
+      
+      CheckNewBar(symbol, lastBarTime[i], i);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ポジション情報同期関数                                          |
+//+------------------------------------------------------------------+
+void SyncPositionData()
+{
+   for(int i = 0; i < 3; i++) {
+      string symbol = GetSymbolByIndex(i);
+      if(symbol == "") continue;
+      
+      if(PositionSelect(symbol)) {
+         ulong ticket = PositionGetInteger(POSITION_TICKET);
+         // 新しいポジションを検出
+         if(positionInfo[i].ticket != ticket) {
+            positionInfo[i].ticket = ticket;
+            positionInfo[i].entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            positionInfo[i].entryTime = (datetime)PositionGetInteger(POSITION_TIME);
+            
+            // SL/TP再計算
+            double range = GetAverageRange(symbol, GetSymbolIndex(symbol));
+            if(range > 0) {
+               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
+                  positionInfo[i].slPrice = positionInfo[i].entryPrice - range * ATR_Multiplier;
+                  positionInfo[i].tpPrice = positionInfo[i].entryPrice + range * TP_ATR_Multiplier;
+               } else {
+                  positionInfo[i].slPrice = positionInfo[i].entryPrice + range * ATR_Multiplier;
+                  positionInfo[i].tpPrice = positionInfo[i].entryPrice - range * TP_ATR_Multiplier;
+               }
+            }
+         }
+      } else {
+         // ポジションが存在しない場合、内部データをリセット
+         if(positionInfo[i].ticket != 0) {
+            positionInfo[i].slPrice = 0;
+            positionInfo[i].tpPrice = 0;
+            positionInfo[i].ticket = 0;
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 新しいバーチェック                                               |
+//+------------------------------------------------------------------+
+void CheckNewBar(string symbol, datetime &lastBarTime, int symbolIndex)
+{
+    datetime currentTime[1];
+    if(CopyTime(symbol, _Period, 0, 1, currentTime) == 1) {
+        if(currentTime[0] != lastBarTime) {
+            lastBarTime = currentTime[0];
+            ProcessTrading(symbol, symbolIndex);
+            CheckExitConditions(symbol, symbolIndex);
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| 取引処理                                                        |
+//+------------------------------------------------------------------+
+void ProcessTrading(string symbol, int symbolIndex)
+{
+   double inputs[2]; // 2つの入力特徴量
+   PrepareInputData(symbol, symbolIndex, inputs);
+   
+   double prediction = NeuralNetwork(inputs);
+   ExecuteTrade(symbol, symbolIndex, prediction);
+}
+
+//+------------------------------------------------------------------+
+//| 平均変動幅取得（ATRを使用）                                      |
+//+------------------------------------------------------------------+
+double GetAverageRange(string symbol, int symbolIndex)
+{
+   double atr[1];
+   if(CopyBuffer(atrHandles[symbolIndex], 0, 1, 1, atr) == 1) {
+      return atr[0];
+   }
+   Print("Error: Failed to get ATR value for ", symbol);
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Leaky ReLU関数                                                   |
+//+------------------------------------------------------------------+
+double leakyRelu(double x) {
+   return (x > 0) ? x : 0.01 * x;
+}
+
+//+------------------------------------------------------------------+
+//| ニューラルネットワーク (2-3-1構造)                              |
+//+------------------------------------------------------------------+
+double NeuralNetwork(double &inputs[])
+{
+   // 隠れ層の計算 (3ユニット)
+   double h1[3];
+   // 入力層(2) → 隠れ層(3)の計算
+   h1[0] = inputs[0]*w1_0_0 + inputs[1]*w1_1_0 + b1_0;
+   h1[1] = inputs[0]*w1_0_1 + inputs[1]*w1_1_1 + b1_1;
+   h1[2] = inputs[0]*w1_0_2 + inputs[1]*w1_1_2 + b1_2;
+   
+   // Leaky ReLU活性化関数
+   for(int i=0; i<3; i++) {
+      h1[i] = leakyRelu(h1[i]);
+   }
+   
+   // 出力層の計算
+   double output = h1[0]*w2_0 + h1[1]*w2_1 + h1[2]*w2_2 + b2;
+   
+   // シグモイド活性化関数
+   return 1.0 / (1.0 + MathExp(-output));
+}
+
+//+------------------------------------------------------------------+
+//| 取引実行                                                        |
+//+------------------------------------------------------------------+
+void ExecuteTrade(string symbol, int symbolIndex, double prediction)
+{
+   // 現在ポジション確認
+   bool hasPosition = PositionSelect(symbol);
+   int currentPos = hasPosition ? 
+                   (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 1 : -1) : 0;
+   
+   // エントリー条件
+   if(prediction > 0.6 && currentPos <= 0) 
+   {
+      // 売りポジションがあれば決済
+      if(currentPos < 0) ClosePosition(symbol);
+      
+      double range = GetAverageRange(symbol, symbolIndex);
+      if(range <= 0) return;
+      
+      double lot = CalculateLotSize(symbol, range);
+      if(lot <= 0) return;
+      
+      // エントリー価格（確定足の終値）
+      double price = iClose(symbol, _Period, 1);
+      
+      // ストップロス価格計算
+      double slPrice = price - range * ATR_Multiplier;
+      
+      // テイクプロフィット価格計算
+      double tpPrice = price + range * TP_ATR_Multiplier;
+      
+      // ポジション開設
+      if(ExecuteOrder(symbol, ORDER_TYPE_BUY, lot, slPrice, tpPrice, symbolIndex)) 
+      {
+         Print("Buy signal - Prediction: ", DoubleToString(prediction, 4));
+      }
+   }
+   else if(prediction < 0.4 && currentPos >= 0) 
+   {
+      // 買いポジションがあれば決済
+      if(currentPos > 0) ClosePosition(symbol);
+      
+      double range = GetAverageRange(symbol, symbolIndex);
+      if(range <= 0) return;
+      
+      double lot = CalculateLotSize(symbol, range);
+      if(lot <= 0) return;
+      
+      // エントリー価格（確定足の終値）
+      double price = iClose(symbol, _Period, 1);
+      
+      // ストップロス価格計算
+      double slPrice = price + range * ATR_Multiplier;
+      
+      // テイクプロフィット価格計算
+      double tpPrice = price - range * TP_ATR_Multiplier;
+      
+      // ポジション開設
+      if(ExecuteOrder(symbol, ORDER_TYPE_SELL, lot, slPrice, tpPrice, symbolIndex)) 
+      {
+         Print("Sell signal - Prediction: ", DoubleToString(prediction, 4));
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ボラティリティ適応型ロットサイズ計算                             |
+//+------------------------------------------------------------------+
+double CalculateLotSize(string symbol, double range)
+{
+   // リスク管理：ボラティリティ適応型
+   double slDistance = range * ATR_Multiplier;
+   double slPoints = slDistance / SymbolInfoDouble(symbol, SYMBOL_POINT);
+   
+   // 1ポイントあたりの価値（1ロット当たり）を計算
+   double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   
+   // 計算の安全チェック
+   if(tickSize <= 0 || point <= 0) {
+      Print("Error: Invalid tickSize or point for ", symbol);
+      return 0;
+   }
+   
+   double valuePerPoint = tickValue / (tickSize / point);
+   if(valuePerPoint <= 0) {
+      Print("Error: Invalid valuePerPoint for ", symbol);
+      return 0;
+   }
+   
+   // リスク額計算（口座残高の%）
+   double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0;
+   
+   // ロットサイズ計算
+   double lot = riskMoney / (slPoints * valuePerPoint);
+   
+   // ロットサイズの最小・最大値チェック
+   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   
+   lot = MathMax(lot, minLot);
+   lot = MathMin(lot, maxLot);
+   lot = NormalizeDouble(lot / lotStep, 0) * lotStep;
+   
+   return lot;
+}
+
+//+------------------------------------------------------------------+
+//| 注文実行（エラーハンドリング強化版）                             |
+//+------------------------------------------------------------------+
+bool ExecuteOrder(string symbol, ENUM_ORDER_TYPE orderType, double lot, double slPrice, double tpPrice, int symbolIndex)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   int retryCount = 0;
+   const int maxRetries = 3;
+   int waitMs = 200;
+   
+   // 取引が許可されているか確認
+   if(!IsTradeAllowed(symbol)) return false;
+   
+   while(retryCount < maxRetries)
+   {
+      // リクエスト設定
+      request.action = TRADE_ACTION_DEAL;
+      request.symbol = symbol;
+      request.volume = lot;
+      request.type = orderType;
+      request.price = orderType == ORDER_TYPE_BUY ? 
+                     SymbolInfoDouble(symbol, SYMBOL_ASK) : 
+                     SymbolInfoDouble(symbol, SYMBOL_BID);
+      request.deviation = 100;
+      request.sl = 0;
+      request.tp = 0;
+      
+      // 注文実行
+      bool success = OrderSend(request, result);
+      
+      if(success) 
+      {
+         // ポジション情報を内部記録
+         positionInfo[symbolIndex].slPrice = slPrice;
+         positionInfo[symbolIndex].tpPrice = tpPrice;
+         positionInfo[symbolIndex].entryPrice = result.price;
+         positionInfo[symbolIndex].entryTime = TimeCurrent();
+         positionInfo[symbolIndex].ticket = result.deal;
+         
+         Print("Order executed: ", symbol, 
+               " Type: ", EnumToString(orderType),
+               " Lot: ", DoubleToString(lot, 2),
+               " Price: ", DoubleToString(result.price, 5),
+               " SL: ", DoubleToString(slPrice, 5),
+               " TP: ", DoubleToString(tpPrice, 5));
+         return true;
+      } 
+      else 
+      {
+         int errorCode = GetLastError();
+         string errorDesc = GetErrorDescription(errorCode);
+         
+         Print("Order failed (Attempt ", retryCount+1, "): ", 
+               "Error ", errorCode, " - ", errorDesc, 
+               " | Comment: ", result.comment);
+         
+         // リトライ不可能な致命的エラーのチェック
+         if(IsCriticalError(errorCode)) return false;
+         
+         // ロットサイズ関連エラーの処理
+         if(errorCode == 131 || errorCode == 134) 
+         {
+            double newLot = AdjustLotSize(symbol, lot, errorCode);
+            if(newLot > 0 && newLot != lot) 
+            {
+               Print("Adjusting lot size from ", DoubleToString(lot, 2), " to ", DoubleToString(newLot, 2));
+               lot = newLot;
+               continue;
+            }
+         }
+         
+         retryCount++;
+         if(retryCount < maxRetries) 
+         {
+            Print("Retrying in ", waitMs, "ms...");
+            Sleep(waitMs);
+         }
+      }
+   }
+   
+   Print("Order failed after ", maxRetries, " attempts");
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| 退出条件チェック（確定足の終値ベース）                          |
+//+------------------------------------------------------------------+
+void CheckExitConditions(string symbol, int symbolIndex)
+{
+    if(positionInfo[symbolIndex].slPrice == 0 || positionInfo[symbolIndex].tpPrice == 0) 
+        return;
+    
+    // 確定足の終値を使用
+    double close = iClose(symbol, _Period, 1);
+    
+    if(PositionSelect(symbol)) 
+    {
+        bool shouldClose = false;
+        string closeReason = "";
+        ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+        
+        if(posType == POSITION_TYPE_BUY) 
+        {
+            if(close <= positionInfo[symbolIndex].slPrice) {
+                shouldClose = true;
+                closeReason = "SL";
+            }
+            else if(close >= positionInfo[symbolIndex].tpPrice) {
+                shouldClose = true;
+                closeReason = "TP";
+            }
+        }
+        else if(posType == POSITION_TYPE_SELL) 
+        {
+            if(close >= positionInfo[symbolIndex].slPrice) {
+                shouldClose = true;
+                closeReason = "SL";
+            }
+            else if(close <= positionInfo[symbolIndex].tpPrice) {
+                shouldClose = true;
+                closeReason = "TP";
+            }
+        }
+        
+        if(shouldClose) {
+            ClosePosition(symbol);
+            positionInfo[symbolIndex].slPrice = 0;
+            positionInfo[symbolIndex].tpPrice = 0;
+            
+            Print(closeReason, " triggered: ", symbol, 
+                  " Close Price: ", DoubleToString(close, 5),
+                  " SL: ", DoubleToString(positionInfo[symbolIndex].slPrice, 5),
+                  " TP: ", DoubleToString(positionInfo[symbolIndex].tpPrice, 5));
+        }
+    }
+}
+
+//+------------------------------------------------------------------+
+//| ポジション決済                                                  |
+//+------------------------------------------------------------------+
+void ClosePosition(string symbol)
+{
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   int retryCount = 0;
+   const int maxRetries = 3;
+   
+   if(!PositionSelect(symbol)) return;
+   
+   double volume = PositionGetDouble(POSITION_VOLUME);
+   ENUM_ORDER_TYPE type = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 
+                         ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+   
+   while(retryCount < maxRetries)
+   {
+      request.action = TRADE_ACTION_DEAL;
+      request.symbol = symbol;
+      request.volume = volume;
+      request.type = type;
+      request.position = PositionGetInteger(POSITION_TICKET);
+      request.price = type == ORDER_TYPE_BUY ? 
+                     SymbolInfoDouble(symbol, SYMBOL_ASK) : 
+                     SymbolInfoDouble(symbol, SYMBOL_BID);
+      request.deviation = 100;
+      
+      if(OrderSend(request, result)) {
+         Print("Position closed: ", symbol, " Volume: ", DoubleToString(volume, 2));
+         return;
+      } else {
+         int errorCode = GetLastError();
+         Print("Close position failed (Attempt ", retryCount+1, "): ", 
+               "Error ", errorCode, " - ", GetErrorDescription(errorCode),
+               " | Comment: ", result.comment);
+         
+         if(IsCriticalError(errorCode)) return;
+         
+         retryCount++;
+         if(retryCount < maxRetries) Sleep(200);
+      }
+   }
+   
+   Print("Close position failed after ", maxRetries, " attempts");
+}
+
+//+------------------------------------------------------------------+
+//| 通貨インデックス取得                                             |
+//+------------------------------------------------------------------+
+int GetSymbolIndex(string symbol)
+{
+   if(symbol == Symbol1) return 0;
+   if(symbol == Symbol2) return 1;
+   if(symbol == Symbol3) return 2;
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| インデックスから通貨ペアを取得                                    |
+//+------------------------------------------------------------------+
+string GetSymbolByIndex(int index)
+{
+   switch(index) {
+      case 0: return Symbol1;
+      case 1: return Symbol2;
+      case 2: return Symbol3;
+      default: return "";
+   }
+}
+
+//+------------------------------------------------------------------+
+//| エラー説明を取得                                                |
+//+------------------------------------------------------------------+
+string GetErrorDescription(int errorCode)
+{
+   switch(errorCode)
+   {
+      case 0:     return "No error";
+      case 1:     return "No error, trade succeeded";
+      case 2:     return "Common error";
+      case 3:     return "Invalid trade parameters";
+      case 4:     return "Trade server is busy";
+      case 5:     return "Old version of the client terminal";
+      case 6:     return "No connection with trade server";
+      case 7:     return "Not enough rights";
+      case 8:     return "Too frequent requests";
+      case 9:     return "Malfunctional trade operation";
+      case 64:    return "Account disabled";
+      case 65:    return "Invalid account";
+      case 128:   return "Trade timeout";
+      case 129:   return "Invalid price";
+      case 130:   return "Invalid stops";
+      case 131:   return "Invalid trade volume";
+      case 132:   return "Market is closed";
+      case 133:   return "Trade is disabled";
+      case 134:   return "Not enough money";
+      case 135:   return "Price changed";
+      case 136:   return "Off quotes";
+      case 137:   return "Broker is busy";
+      case 138:   return "Requote";
+      case 139:   return "Order is locked";
+      case 140:   return "Long positions only allowed";
+      case 141:   return "Too many requests";
+      case 145:   return "Modification denied because order is too close to market";
+      case 146:   return "Trade context is busy";
+      case 147:   return "Expirations are denied by broker";
+      case 148:   return "The amount of open and pending orders has reached the limit";
+      case 149:   return "Hedging is prohibited";
+      case 150:   return "Prohibited by FIFO rules";
+      default:    return "Unknown error";
+   }
+}
+
+//+------------------------------------------------------------------+
+//| 致命的エラーのチェック                                          |
+//+------------------------------------------------------------------+
+bool IsCriticalError(int errorCode)
+{
+   int criticalErrors[] = {133, 139, 145, 146, 147, 148, 149, 150, 4051};
+   for(int i=0; i<ArraySize(criticalErrors); i++) 
+      if(errorCode == criticalErrors[i]) return true;
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ロットサイズ調整                                                |
+//+------------------------------------------------------------------+
+double AdjustLotSize(string symbol, double requestedLot, int errorCode)
+{
+   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double stepLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   
+   // 無効なロットサイズエラー (131)
+   if(errorCode == 131) 
+   {
+      if(requestedLot < minLot) return minLot;
+      if(requestedLot > maxLot) return maxLot;
+      
+      double adjustedLot = NormalizeDouble(requestedLot / stepLot, 0) * stepLot;
+      if(adjustedLot != requestedLot) return adjustedLot;
+   }
+   
+   // 資金不足エラー (134)
+   if(errorCode == 134) 
+   {
+      double marginRequired;
+      if(OrderCalcMargin(ORDER_TYPE_BUY, symbol, requestedLot, SymbolInfoDouble(symbol, SYMBOL_ASK), marginRequired))
+      {
+         double maxAffordableLot = requestedLot;
+         while(marginRequired > equity * 0.8 && maxAffordableLot > minLot)
+         {
+            maxAffordableLot -= stepLot;
+            if(!OrderCalcMargin(ORDER_TYPE_BUY, symbol, maxAffordableLot, SymbolInfoDouble(symbol, SYMBOL_ASK), marginRequired))
+               break;
+         }
+         if(maxAffordableLot >= minLot) return maxAffordableLot;
+      }
+   }
+   return -1;
+}
+
+//+------------------------------------------------------------------+
+//| 取引が許可されているか確認                                      |
+//+------------------------------------------------------------------+
+bool IsTradeAllowed(string symbol)
+{
+   if(!SymbolInfoInteger(symbol, SYMBOL_SELECT)) return false;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED)) return false;
+   if(!SymbolInfoInteger(symbol, SYMBOL_TRADE_MODE)) return false;
+   if(AccountInfoInteger(ACCOUNT_TRADE_EXPERT) == 0) return false;
+   if(AccountInfoDouble(ACCOUNT_MARGIN_LEVEL) > 0 && 
+      AccountInfoDouble(ACCOUNT_MARGIN_LEVEL) < 100) return false;
+   return true;
+}
+//+------------------------------------------------------------------+
