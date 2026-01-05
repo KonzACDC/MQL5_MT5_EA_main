@@ -20,6 +20,7 @@ input group "Trading Symbols"
 input string Symbol1 = "EURUSD";            // 通貨ペア1
 input string Symbol2 = "GBPUSD";            // 通貨ペア2
 input string Symbol3 = "USDJPY";            // 通貨ペア3
+input ENUM_ORDER_TYPE_FILLING input_Filling_type = SYMBOL_FILLING_IOC;
 
 input group "Feature Parameters"
 input int r_Period = 14;                    // r計算用の期間(n)
@@ -469,7 +470,6 @@ double CalculateLotSize(string symbol, double range)
    
    return lot;
 }
-
 //+------------------------------------------------------------------+
 //| 注文実行（エラーハンドリング強化版）                             |
 //+------------------------------------------------------------------+
@@ -491,6 +491,7 @@ bool ExecuteOrder(string symbol, ENUM_ORDER_TYPE orderType, double lot, double s
       request.symbol = symbol;
       request.volume = lot;
       request.type = orderType;
+      request.type_filling = input_Filling_type;
       request.price = orderType == ORDER_TYPE_BUY ? 
                      SymbolInfoDouble(symbol, SYMBOL_ASK) : 
                      SymbolInfoDouble(symbol, SYMBOL_BID);
@@ -498,6 +499,7 @@ bool ExecuteOrder(string symbol, ENUM_ORDER_TYPE orderType, double lot, double s
       request.sl = 0;
       request.tp = 0;
       
+
       // 注文実行
       bool success = OrderSend(request, result);
       
@@ -630,6 +632,7 @@ void ClosePosition(string symbol)
       request.symbol = symbol;
       request.volume = volume;
       request.type = type;
+      request.type_filling = input_Filling_type;
       request.position = PositionGetInteger(POSITION_TICKET);
       request.price = type == ORDER_TYPE_BUY ? 
                      SymbolInfoDouble(symbol, SYMBOL_ASK) : 
