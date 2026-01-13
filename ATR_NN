@@ -1,11 +1,11 @@
 //+------------------------------------------------------------------+
 //|                     NeuralNetworkEA.mq5                          |
-//|                        Version 3.1                              |
-//|        改修版: 2つの入力特徴量(rとvol)を使用したニューラルネットワーク戦略 |
+//|                        Version 3.2                              |
+//| 改修版: 2つの入力特徴量(rとvol)を使用し、ニューラルネットワークの出力強度でロット数を変動 |
 //+------------------------------------------------------------------+
 #property copyright "Copyright 2023, MetaQuotes Ltd."
 #property link      "https://www.metaquotes.net/"
-#property version   "3.1"
+#property version   "3.2"
 #property strict
 
 //+------------------------------------------------------------------+
@@ -14,7 +14,15 @@
 input group "Risk Management"
 input double ATR_Multiplier = 2.0;          // SL用変動幅乗数
 input double TP_ATR_Multiplier = 3.0;       // TP用変動幅乗数
-input double RiskPercent = 1.0;             // リスク率（%）
+input double RiskPercent = 1.0;             // 基本リスク率（%）
+input double MaxRiskPercent = 2.0;          // 最大リスク率（%）
+
+input group "Lot Size Control by Neural Network"
+input double BuyThreshold = 0.55;           // 買いシグナル閾値
+input double SellThreshold = 0.45;          // 売りシグナル閾値
+input bool UseDynamicLot = true;            // 動的ロットサイズを使用
+input double MinLotMultiplier = 0.3;        // 最小ロット乗数
+input double MaxLotMultiplier = 2.0;        // 最大ロット乗数
 
 input group "Trading Symbols"
 input string Symbol1 = "EURUSD";            // 通貨ペア1
@@ -56,6 +64,7 @@ struct PositionData {
    double entryPrice;  // エントリー価格
    datetime entryTime; // エントリー時間
    ulong ticket;       // ポジションチケットID
+   double confidence;  // ニューラルネットワークの信頼度
 };
 PositionData positionInfo[3]; // 各通貨ごとのポジションデータ
 
@@ -75,6 +84,21 @@ int OnInit()
       return INIT_FAILED;
    }
    
+   if(BuyThreshold <= SellThreshold) {
+      Print("Error: BuyThreshold must be greater than SellThreshold");
+      return INIT_FAILED;
+   }
+   
+   if(MinLotMultiplier < 0.1 || MaxLotMultiplier < MinLotMultiplier) {
+      Print("Error: Invalid lot multiplier values");
+      return INIT_FAILED;
+   }
+   
+   if(RiskPercent <= 0 || RiskPercent > 10) {
+      Print("Error: RiskPercent must be between 0.1 and 10");
+      return INIT_FAILED;
+   }
+   
    // ポジションデータ初期化
    for(int i = 0; i < 3; i++) {
       positionInfo[i].slPrice = 0;
@@ -82,6 +106,7 @@ int OnInit()
       positionInfo[i].entryPrice = 0;
       positionInfo[i].entryTime = 0;
       positionInfo[i].ticket = 0;
+      positionInfo[i].confidence = 0;
       lastBarTime[i] = 0;
    }
    
@@ -95,9 +120,9 @@ int OnInit()
       return INIT_FAILED;
    }
    
-   Print("EA initialized successfully with 2 input features: r and vol");
-   Print("r = (Close[0] - Close[", r_Period, "]) / ATR(", r_Period, ")");
-   Print("vol = ATR(", ATR_Short_Period, ") / ATR(", ATR_Long_Period, ")");
+   Print("EA initialized successfully with dynamic lot sizing based on neural network output");
+   Print("Buy threshold: ", BuyThreshold, ", Sell threshold: ", SellThreshold);
+   Print("Lot multipliers: Min=", MinLotMultiplier, ", Max=", MaxLotMultiplier);
    
    return(INIT_SUCCEEDED);
 }
@@ -286,6 +311,7 @@ void SyncPositionData()
             positionInfo[i].slPrice = 0;
             positionInfo[i].tpPrice = 0;
             positionInfo[i].ticket = 0;
+            positionInfo[i].confidence = 0;
          }
       }
    }
@@ -363,6 +389,52 @@ double NeuralNetwork(double &inputs[])
 }
 
 //+------------------------------------------------------------------+
+//| ニューラルネットワーク出力に基づくロット乗数を計算               |
+//+------------------------------------------------------------------+
+double CalculateLotMultiplier(double prediction, ENUM_ORDER_TYPE orderType)
+{
+   if(!UseDynamicLot) return 1.0;
+   
+   // 予測値が0.5から離れるほど乗数を大きくする
+   double confidence;
+   
+   if(orderType == ORDER_TYPE_BUY) {
+      // 買いの場合：predictionが0.55～1.0
+      confidence = (prediction - 0.5) * 2.0; // 0.1～1.0
+   } else if(orderType == ORDER_TYPE_SELL) {
+      // 売りの場合：predictionが0.0～0.45
+      confidence = (0.5 - prediction) * 2.0; // 0.1～1.0
+   } else {
+      return 1.0;
+   }
+   
+   // 信頼度を0.0～1.0に正規化
+   confidence = MathMax(0.0, MathMin(1.0, confidence));
+   
+   // 線形補間で乗数を計算
+   double multiplier = MinLotMultiplier + confidence * (MaxLotMultiplier - MinLotMultiplier);
+   
+   return multiplier;
+}
+
+//+------------------------------------------------------------------+
+//| ニューラルネットワーク出力に基づくリスク率を計算                 |
+//+------------------------------------------------------------------+
+double CalculateDynamicRiskPercent(double prediction, ENUM_ORDER_TYPE orderType)
+{
+   if(!UseDynamicLot) return RiskPercent;
+   
+   double multiplier = CalculateLotMultiplier(prediction, orderType);
+   double dynamicRisk = RiskPercent * multiplier;
+   
+   // 最大リスク率で制限
+   dynamicRisk = MathMin(dynamicRisk, MaxRiskPercent);
+   dynamicRisk = MathMax(dynamicRisk, 0.1); // 最小0.1%
+   
+   return dynamicRisk;
+}
+
+//+------------------------------------------------------------------+
 //| 取引実行                                                        |
 //+------------------------------------------------------------------+
 void ExecuteTrade(string symbol, int symbolIndex, double prediction)
@@ -372,8 +444,8 @@ void ExecuteTrade(string symbol, int symbolIndex, double prediction)
    int currentPos = hasPosition ? 
                    (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 1 : -1) : 0;
    
-   // エントリー条件
-   if(prediction > 0.6 && currentPos <= 0) 
+   // エントリー条件：0.55以上で買い、0.45以下で売り
+   if(prediction >= BuyThreshold && currentPos <= 0) 
    {
       // 売りポジションがあれば決済
       if(currentPos < 0) ClosePosition(symbol);
@@ -381,7 +453,15 @@ void ExecuteTrade(string symbol, int symbolIndex, double prediction)
       double range = GetAverageRange(symbol, symbolIndex);
       if(range <= 0) return;
       
-      double lot = CalculateLotSize(symbol, range);
+      // ニューラルネットワークの信頼度に基づく動的ロット計算
+      double baseLot = CalculateBaseLotSize(symbol, range);
+      if(baseLot <= 0) return;
+      
+      double lotMultiplier = CalculateLotMultiplier(prediction, ORDER_TYPE_BUY);
+      double lot = baseLot * lotMultiplier;
+      
+      // ロットの最小・最大・ステップを考慮して正規化
+      lot = NormalizeLotSize(symbol, lot);
       if(lot <= 0) return;
       
       // エントリー価格（確定足の終値）
@@ -394,12 +474,14 @@ void ExecuteTrade(string symbol, int symbolIndex, double prediction)
       double tpPrice = price + range * TP_ATR_Multiplier;
       
       // ポジション開設
-      if(ExecuteOrder(symbol, ORDER_TYPE_BUY, lot, slPrice, tpPrice, symbolIndex)) 
+      if(ExecuteOrder(symbol, ORDER_TYPE_BUY, lot, slPrice, tpPrice, symbolIndex, prediction)) 
       {
-         Print("Buy signal - Prediction: ", DoubleToString(prediction, 4));
+         Print("Buy signal - Prediction: ", DoubleToString(prediction, 4),
+               ", Lot multiplier: ", DoubleToString(lotMultiplier, 2),
+               ", Lot size: ", DoubleToString(lot, 2));
       }
    }
-   else if(prediction < 0.4 && currentPos >= 0) 
+   else if(prediction <= SellThreshold && currentPos >= 0) 
    {
       // 買いポジションがあれば決済
       if(currentPos > 0) ClosePosition(symbol);
@@ -407,7 +489,15 @@ void ExecuteTrade(string symbol, int symbolIndex, double prediction)
       double range = GetAverageRange(symbol, symbolIndex);
       if(range <= 0) return;
       
-      double lot = CalculateLotSize(symbol, range);
+      // ニューラルネットワークの信頼度に基づく動的ロット計算
+      double baseLot = CalculateBaseLotSize(symbol, range);
+      if(baseLot <= 0) return;
+      
+      double lotMultiplier = CalculateLotMultiplier(prediction, ORDER_TYPE_SELL);
+      double lot = baseLot * lotMultiplier;
+      
+      // ロットの最小・最大・ステップを考慮して正規化
+      lot = NormalizeLotSize(symbol, lot);
       if(lot <= 0) return;
       
       // エントリー価格（確定足の終値）
@@ -420,17 +510,27 @@ void ExecuteTrade(string symbol, int symbolIndex, double prediction)
       double tpPrice = price - range * TP_ATR_Multiplier;
       
       // ポジション開設
-      if(ExecuteOrder(symbol, ORDER_TYPE_SELL, lot, slPrice, tpPrice, symbolIndex)) 
+      if(ExecuteOrder(symbol, ORDER_TYPE_SELL, lot, slPrice, tpPrice, symbolIndex, prediction)) 
       {
-         Print("Sell signal - Prediction: ", DoubleToString(prediction, 4));
+         Print("Sell signal - Prediction: ", DoubleToString(prediction, 4),
+               ", Lot multiplier: ", DoubleToString(lotMultiplier, 2),
+               ", Lot size: ", DoubleToString(lot, 2));
+      }
+   }
+   else
+   {
+      // 中立ゾーン：predictionが0.45～0.55の間
+      if(MathRand() % 100 == 0) { // 1%の確率でログ出力
+         Print("Neutral zone - Prediction: ", DoubleToString(prediction, 4),
+               " (Buy threshold: ", BuyThreshold, ", Sell threshold: ", SellThreshold, ")");
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| ボラティリティ適応型ロットサイズ計算                             |
+//| 基本ロットサイズ計算（動的リスク率を使用）                      |
 //+------------------------------------------------------------------+
-double CalculateLotSize(string symbol, double range)
+double CalculateBaseLotSize(string symbol, double range)
 {
    // リスク管理：ボラティリティ適応型
    double slDistance = range * ATR_Multiplier;
@@ -453,16 +553,29 @@ double CalculateLotSize(string symbol, double range)
       return 0;
    }
    
-   // リスク額計算（口座残高の%）
+   // 基本リスク額計算（口座残高の%）
    double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0;
    
-   // ロットサイズ計算
-   double lot = riskMoney / (slPoints * valuePerPoint);
+   // 基本ロットサイズ計算
+   double baseLot = riskMoney / (slPoints * valuePerPoint);
    
+   return baseLot;
+}
+
+//+------------------------------------------------------------------+
+//| ロットサイズを正規化                                            |
+//+------------------------------------------------------------------+
+double NormalizeLotSize(string symbol, double lot)
+{
    // ロットサイズの最小・最大値チェック
    double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
    double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   
+   if(minLot <= 0 || maxLot <= 0 || lotStep <= 0) {
+      Print("Error: Invalid lot size parameters for ", symbol);
+      return 0;
+   }
    
    lot = MathMax(lot, minLot);
    lot = MathMin(lot, maxLot);
@@ -470,10 +583,11 @@ double CalculateLotSize(string symbol, double range)
    
    return lot;
 }
+
 //+------------------------------------------------------------------+
-//| 注文実行（エラーハンドリング強化版）                             |
+//| 注文実行                                                        |
 //+------------------------------------------------------------------+
-bool ExecuteOrder(string symbol, ENUM_ORDER_TYPE orderType, double lot, double slPrice, double tpPrice, int symbolIndex)
+bool ExecuteOrder(string symbol, ENUM_ORDER_TYPE orderType, double lot, double slPrice, double tpPrice, int symbolIndex, double prediction)
 {
    MqlTradeRequest request = {};
    MqlTradeResult result = {};
@@ -499,7 +613,6 @@ bool ExecuteOrder(string symbol, ENUM_ORDER_TYPE orderType, double lot, double s
       request.sl = 0;
       request.tp = 0;
       
-
       // 注文実行
       bool success = OrderSend(request, result);
       
@@ -511,9 +624,11 @@ bool ExecuteOrder(string symbol, ENUM_ORDER_TYPE orderType, double lot, double s
          positionInfo[symbolIndex].entryPrice = result.price;
          positionInfo[symbolIndex].entryTime = TimeCurrent();
          positionInfo[symbolIndex].ticket = result.deal;
+         positionInfo[symbolIndex].confidence = prediction;
          
          Print("Order executed: ", symbol, 
                " Type: ", EnumToString(orderType),
+               " Prediction: ", DoubleToString(prediction, 4),
                " Lot: ", DoubleToString(lot, 2),
                " Price: ", DoubleToString(result.price, 5),
                " SL: ", DoubleToString(slPrice, 5),
@@ -601,6 +716,7 @@ void CheckExitConditions(string symbol, int symbolIndex)
             ClosePosition(symbol);
             positionInfo[symbolIndex].slPrice = 0;
             positionInfo[symbolIndex].tpPrice = 0;
+            positionInfo[symbolIndex].confidence = 0;
             
             Print(closeReason, " triggered: ", symbol, 
                   " Close Price: ", DoubleToString(close, 5),
