@@ -1,0 +1,1555 @@
+//+------------------------------------------------------------------+
+//|      NeuralNetworkEA_RSI_BB_Position_TrailingStop.mq5           |
+//|                        Version 7.0                               |
+//| 改修版: ニューラルネットワークの入力特徴量をRSIとボリンジャーバンド位置に変更 |
+//|         2つの入力特徴量(RSI + ボリンジャーバンド位置)を使用し、ニューラルネットワークの出力強度でロット数を変動 |
+//|         隠れ層と出力層の活性化関数をTanhに統一                   |
+//+------------------------------------------------------------------+
+#property copyright "Copyright 2023, MetaQuotes Ltd."
+#property link      "https://www.metaquotes.net/"
+#property version   "7.0"
+#property strict
+
+//+------------------------------------------------------------------+
+//| 入力パラメータ                                                  |
+//+------------------------------------------------------------------+
+input group "Risk Management"
+input double ATR_Multiplier = 2.0;          // SL用変動幅乗数
+input double TP_ATR_Multiplier = 3.0;       // TP用変動幅乗数
+input double RiskPercent = 1.0;             // 基本リスク率（%）
+input double MaxRiskPercent = 2.0;          // 最大リスク率（%）
+
+input group "Trailing Stop"
+input bool EnableTrailingStop = true;       // トレーリングストップを有効化
+input double TrailingStart_ATR = 1.5;       // トレーリング開始距離（ATR倍率）
+input double TrailingStep_ATR = 0.5;        // トレーリングステップ（ATR倍率）
+input bool UsePartialTrailing = true;       // 部分的なトレーリングを使用（段階的にSLを移動）
+input int TrailEveryXBars = 1;              // トレーリング実行間隔（バー数）
+
+input group "Lot Size Control by Neural Network"
+input double BuyThreshold = 0.1;            // 買いシグナル閾値（tanh用: -1.0～1.0）
+input double SellThreshold = -0.1;          // 売りシグナル閾値（tanh用: -1.0～1.0）
+input bool UseDynamicLot = true;            // 動的ロットサイズを使用
+input double MinLotMultiplier = 0.3;        // 最小ロット乗数
+input double MaxLotMultiplier = 2.0;        // 最大ロット乗数
+
+input group "Trading Symbols"
+input string Symbol1 = "EURUSD";            // 通貨ペア1
+input string Symbol2 = "GBPUSD";            // 通貨ペア2
+input string Symbol3 = "USDJPY";            // 通貨ペア3
+input ENUM_ORDER_TYPE_FILLING input_Filling_type = SYMBOL_FILLING_IOC;
+
+input group "Indicator Parameters"
+input int RSI_Period = 14;                  // RSI計算用の期間
+input int BB_Period = 20;                   // ボリンジャーバンド計算用の期間
+input double BB_Deviation = 2.0;            // ボリンジャーバンドの標準偏差
+input ENUM_APPLIED_PRICE BB_Applied_Price = PRICE_CLOSE; // ボリンジャーバンド適用価格
+
+input group "ATR Parameters (for position sizing and normalization)"
+input int ATR_Period = 14;                  // ATR期間（ロット計算用）
+
+input group "Feature Normalization"
+input bool NormalizeFeatures = true;        // 特徴量を正規化する
+
+input group "Neural Network Parameters"
+// 入力層→隠れ層の重み (2入力×3ノード)
+// RSIの重み
+input double w1_0_0 = 0.1, w1_0_1 = 0.2, w1_0_2 = 0.3;
+// ボリンジャーバンド位置の重み
+input double w1_1_0 = -0.1, w1_1_1 = -0.2, w1_1_2 = -0.3;
+
+// 隠れ層のバイアス (3ノード)
+input double b1_0 = 0.1, b1_1 = 0.2, b1_2 = 0.3;
+
+// 隠れ層→出力層の重み (3ノード×1出力)
+input double w2_0 = 0.1, w2_1 = 0.2, w2_2 = 0.3;
+
+// 出力層のバイアス
+input double b2 = 0.1;
+
+input group "Tanh Parameters"
+input double TanhAlpha = 1.0;               // Tanhのスケーリング係数
+
+//+------------------------------------------------------------------+
+//| グローバル変数                                                  |
+//+------------------------------------------------------------------+
+datetime lastBarTime[3];                     // 各通貨の最終バー時間
+int rsiHandles[3];                          // RSIインジケーターハンドル
+int bbHandles[3];                           // ボリンジャーバンドインジケーターハンドル
+int atrHandles[3];                          // ATRインジケーターハンドル（ロット計算用）
+
+// ポジション管理構造体（トレーリングストップ情報追加）
+struct PositionData
+  {
+   double            slPrice;           // ストップロス価格（内部管理）
+   double            tpPrice;           // テイクプロフィット価格（内部管理）
+   double            entryPrice;        // エントリー価格
+   datetime          entryTime;         // エントリー時間
+   ulong             ticket;            // ポジションチケットID
+   double            confidence;        // ニューラルネットワークの信頼度
+   double            bestPrice;         // 最良価格（トレーリングストップ用）
+   double            trailingStart;     // トレーリング開始価格
+   bool              trailingActivated; // トレーリングが開始されたか
+   double            currentATR;        // エントリー時のATR（トレーリング計算用）
+   int               lastTrailBar;      // 最後にトレーリングしたバーのインデックス
+  };
+PositionData positionInfo[3]; // 各通貨ごとのポジションデータ
+
+//+------------------------------------------------------------------+
+//| Expert initialization function                                   |
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+// パラメータの妥当性チェック
+   if(RSI_Period <= 0 || BB_Period <= 0 || ATR_Period <= 0)
+     {
+      Print("Error: Period parameters must be greater than 0");
+      return INIT_FAILED;
+     }
+
+   if(BB_Deviation <= 0)
+     {
+      Print("Error: BB_Deviation must be greater than 0");
+      return INIT_FAILED;
+     }
+
+   if(BuyThreshold <= SellThreshold)
+     {
+      Print("Error: BuyThreshold must be greater than SellThreshold");
+      return INIT_FAILED;
+     }
+
+// tanh出力範囲チェック (-1.0～1.0)
+   if(BuyThreshold < -1.0 || BuyThreshold > 1.0)
+     {
+      Print("Error: BuyThreshold must be between -1.0 and 1.0 for tanh activation");
+      return INIT_FAILED;
+     }
+
+   if(SellThreshold < -1.0 || SellThreshold > 1.0)
+     {
+      Print("Error: SellThreshold must be between -1.0 and 1.0 for tanh activation");
+      return INIT_FAILED;
+     }
+
+   if(MinLotMultiplier < 0.1 || MaxLotMultiplier < MinLotMultiplier)
+     {
+      Print("Error: Invalid lot multiplier values");
+      return INIT_FAILED;
+     }
+
+   if(RiskPercent <= 0 || RiskPercent > 10)
+     {
+      Print("Error: RiskPercent must be between 0.1 and 10");
+      return INIT_FAILED;
+     }
+
+// トレーリングストップパラメータチェック
+   if(TrailingStart_ATR <= 0)
+     {
+      Print("Error: TrailingStart_ATR must be greater than 0");
+      return INIT_FAILED;
+     }
+
+   if(TrailingStep_ATR <= 0)
+     {
+      Print("Error: TrailingStep_ATR must be greater than 0");
+      return INIT_FAILED;
+     }
+
+   if(TrailEveryXBars <= 0)
+     {
+      Print("Error: TrailEveryXBars must be greater than 0");
+      return INIT_FAILED;
+     }
+
+// ポジションデータ初期化
+   for(int i = 0; i < 3; i++)
+     {
+      positionInfo[i].slPrice = 0;
+      positionInfo[i].tpPrice = 0;
+      positionInfo[i].entryPrice = 0;
+      positionInfo[i].entryTime = 0;
+      positionInfo[i].ticket = 0;
+      positionInfo[i].confidence = 0;
+      positionInfo[i].bestPrice = 0;
+      positionInfo[i].trailingStart = 0;
+      positionInfo[i].trailingActivated = false;
+      positionInfo[i].currentATR = 0;
+      positionInfo[i].lastTrailBar = 0;
+      lastBarTime[i] = 0;
+     }
+
+// 通貨ペア初期化
+   InitializeSymbol(Symbol1, 0);
+   InitializeSymbol(Symbol2, 1);
+   InitializeSymbol(Symbol3, 2);
+
+// 初期化チェック
+   if(!IsInitializationValid())
+     {
+      return INIT_FAILED;
+     }
+
+   Print("EA initialized successfully with RSI & Bollinger Bands Position features");
+   Print("Input features: RSI & Bollinger Bands Position");
+   Print("RSI Period: ", RSI_Period);
+   Print("BB Period: ", BB_Period, ", Deviation: ", BB_Deviation);
+   Print("Position sizing using ATR(", ATR_Period, ")");
+   Print("Output range: -1.0 to 1.0");
+   Print("Buy threshold: ", BuyThreshold, ", Sell threshold: ", SellThreshold);
+   Print("Lot multipliers: Min=", MinLotMultiplier, ", Max=", MaxLotMultiplier);
+   Print("Neural network structure: 2-3-1 (All Tanh activation)");
+   Print("Neutral zone: ", SellThreshold, " to ", BuyThreshold);
+   Print("Trailing Stop: ", (EnableTrailingStop ? "Enabled" : "Disabled"));
+   if(EnableTrailingStop)
+     {
+      Print("Trailing Start: ", TrailingStart_ATR, " ATR, Step: ", TrailingStep_ATR, " ATR");
+      Print("Trail Every: ", TrailEveryXBars, " bars, Partial: ", (UsePartialTrailing ? "Yes" : "No"));
+     }
+
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+//| 初期化検証                                                      |
+//+------------------------------------------------------------------+
+bool IsInitializationValid()
+  {
+   for(int i = 0; i < 3; i++)
+     {
+      string symbol = GetSymbolByIndex(i);
+      if(symbol == "")
+         continue;
+
+      if(rsiHandles[i] == INVALID_HANDLE ||
+         bbHandles[i] == INVALID_HANDLE ||
+         atrHandles[i] == INVALID_HANDLE)
+        {
+         Print("Error: Indicator initialization failed for ", symbol);
+         return false;
+        }
+     }
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| 通貨ペア初期化                                                  |
+//+------------------------------------------------------------------+
+void InitializeSymbol(string symbol, int index)
+  {
+// シンボル有効性チェック
+   if(symbol == "" || !SymbolInfoInteger(symbol, SYMBOL_SELECT))
+     {
+      Print("Warning: Invalid symbol - ", symbol);
+      rsiHandles[index] = INVALID_HANDLE;
+      bbHandles[index] = INVALID_HANDLE;
+      atrHandles[index] = INVALID_HANDLE;
+      return;
+     }
+
+// インジケーター初期化
+   rsiHandles[index] = iRSI(symbol, _Period, RSI_Period, PRICE_CLOSE);
+   bbHandles[index] = iBands(symbol, _Period, BB_Period, 0, BB_Deviation, BB_Applied_Price);
+   atrHandles[index] = iATR(symbol, _Period, ATR_Period);
+
+   Print("Initialized indicators for ", symbol,
+         ": RSI(", RSI_Period, "), BB(", BB_Period, ", ", BB_Deviation, "), ATR(", ATR_Period, ")");
+  }
+
+//+------------------------------------------------------------------+
+//| Expert deinitialization function                                 |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+// インジケーターリソース解放
+   for(int i = 0; i < 3; i++)
+     {
+      if(rsiHandles[i] != INVALID_HANDLE)
+         IndicatorRelease(rsiHandles[i]);
+      if(bbHandles[i] != INVALID_HANDLE)
+         IndicatorRelease(bbHandles[i]);
+      if(atrHandles[i] != INVALID_HANDLE)
+         IndicatorRelease(atrHandles[i]);
+     }
+   Print("EA deinitialized");
+  }
+
+//+------------------------------------------------------------------+
+//| 入力データ準備（特徴量: RSI + ボリンジャーバンド位置）          |
+//+------------------------------------------------------------------+
+void PrepareInputData(string symbol, int symbolIndex, double &inputs[])
+  {
+   ArrayResize(inputs, 2); // 入力特徴量は2つ
+
+// 特徴量1: RSI (0～100) を -1.0～1.0 に正規化
+   double rsiValue = GetRSI(symbol, symbolIndex);
+   double rsiNormalized = NormalizeRSI(rsiValue);
+   inputs[0] = rsiNormalized;
+
+// 特徴量2: ボリンジャーバンド位置 (0～1) を -1.0～1.0 に正規化
+   double bbPosition = CalculateBBPosition(symbol, symbolIndex);
+   double bbNormalized = NormalizeBBPosition(bbPosition);
+   inputs[1] = bbNormalized;
+
+// デバッグ用: 特徴量の値を表示
+   if(MathRand() % 100 == 0)   // 1%の確率で表示
+     {
+      double close = iClose(symbol, _Period, 0);
+      double upperBB = GetUpperBB(symbol, symbolIndex);
+      double middleBB = GetMiddleBB(symbol, symbolIndex);
+      double lowerBB = GetLowerBB(symbol, symbolIndex);
+
+      Print(symbol, " - Close: ", DoubleToString(close, 5),
+            ", RSI: ", DoubleToString(rsiValue, 2),
+            ", RSI (norm): ", DoubleToString(rsiNormalized, 4),
+            ", BB Position: ", DoubleToString(bbPosition, 4),
+            ", BB (norm): ", DoubleToString(bbNormalized, 4),
+            ", Upper BB: ", DoubleToString(upperBB, 5),
+            ", Middle BB: ", DoubleToString(middleBB, 5),
+            ", Lower BB: ", DoubleToString(lowerBB, 5));
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| RSI値を取得                                                     |
+//+------------------------------------------------------------------+
+double GetRSI(string symbol, int symbolIndex)
+  {
+   double rsiValue[1];
+   if(CopyBuffer(rsiHandles[symbolIndex], 0, 0, 1, rsiValue) == 1)
+     {
+      return rsiValue[0];
+     }
+   Print("Error: Failed to get RSI value for ", symbol);
+   return 50.0; // エラー時は中立値50を返す
+  }
+
+//+------------------------------------------------------------------+
+//| RSIを正規化 (-1.0～1.0)                                         |
+//+------------------------------------------------------------------+
+double NormalizeRSI(double rsi)
+  {
+   if(!NormalizeFeatures)
+      return (rsi - 50.0) / 50.0; // そのまま正規化
+
+   // RSIを0～100の範囲にクリップ
+   rsi = MathMin(MathMax(rsi, 0.0), 100.0);
+
+   // -1.0～1.0に正規化: (RSI - 50) / 50
+   double normalized = (rsi - 50.0) / 50.0;
+
+   return normalized;
+  }
+
+//+------------------------------------------------------------------+
+//| ボリンジャーバンド位置を計算 (0～1)                             |
+//+------------------------------------------------------------------+
+double CalculateBBPosition(string symbol, int symbolIndex)
+  {
+   double upperBand[1], lowerBand[1];
+   double close = iClose(symbol, _Period, 0);
+
+   // 上バンドと下バンドを取得
+   if(CopyBuffer(bbHandles[symbolIndex], 1, 0, 1, upperBand) == 1 &&
+      CopyBuffer(bbHandles[symbolIndex], 2, 0, 1, lowerBand) == 1)
+     {
+      double bandWidth = upperBand[0] - lowerBand[0];
+
+      // バンド幅が0または負の場合は0.5を返す（中央）
+      if(bandWidth <= 0)
+        {
+         Print("Warning: Invalid Bollinger Bands width for ", symbol);
+         return 0.5;
+        }
+
+      // ボリンジャーバンド位置を計算: (終値 - 下バンド) / (上バンド - 下バンド)
+      double position = (close - lowerBand[0]) / bandWidth;
+
+      // 0～1の範囲にクリップ
+      position = MathMin(MathMax(position, 0.0), 1.0);
+
+      return position;
+     }
+
+   Print("Error: Failed to get Bollinger Bands values for ", symbol);
+   return 0.5; // エラー時は中央値を返す
+  }
+
+//+------------------------------------------------------------------+
+//| ボリンジャーバンド位置を正規化 (-1.0～1.0)                       |
+//+------------------------------------------------------------------+
+double NormalizeBBPosition(double position)
+  {
+   if(!NormalizeFeatures)
+      return position * 2.0 - 1.0; // そのまま正規化
+
+   // 位置を0～1の範囲にクリップ
+   position = MathMin(MathMax(position, 0.0), 1.0);
+
+   // -1.0～1.0に正規化: position * 2 - 1
+   double normalized = position * 2.0 - 1.0;
+
+   return normalized;
+  }
+
+//+------------------------------------------------------------------+
+//| 上ボリンジャーバンドを取得                                       |
+//+------------------------------------------------------------------+
+double GetUpperBB(string symbol, int symbolIndex)
+  {
+   double upperBand[1];
+   if(CopyBuffer(bbHandles[symbolIndex], 1, 0, 1, upperBand) == 1)
+     {
+      return upperBand[0];
+     }
+   return -1;
+  }
+
+//+------------------------------------------------------------------+
+//| 中ボリンジャーバンドを取得                                       |
+//+------------------------------------------------------------------+
+double GetMiddleBB(string symbol, int symbolIndex)
+  {
+   double middleBand[1];
+   if(CopyBuffer(bbHandles[symbolIndex], 0, 0, 1, middleBand) == 1)
+     {
+      return middleBand[0];
+     }
+   return -1;
+  }
+
+//+------------------------------------------------------------------+
+//| 下ボリンジャーバンドを取得                                       |
+//+------------------------------------------------------------------+
+double GetLowerBB(string symbol, int symbolIndex)
+  {
+   double lowerBand[1];
+   if(CopyBuffer(bbHandles[symbolIndex], 2, 0, 1, lowerBand) == 1)
+     {
+      return lowerBand[0];
+     }
+   return -1;
+  }
+
+//+------------------------------------------------------------------+
+//| Expert tick function                                             |
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+// ポジション情報をリアルタイムで同期
+   SyncPositionData();
+
+// ニューラルネットワーク出力の分析（定期的に）
+   AnalyzeNeuralNetworkOutput();
+
+// 各通貨ペアの新しいバーをチェック
+   for(int i = 0; i < 3; i++)
+     {
+      string symbol = GetSymbolByIndex(i);
+      if(symbol == "" || rsiHandles[i] == INVALID_HANDLE)
+         continue;
+
+      CheckNewBar(symbol, lastBarTime[i], i);
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| ポジション情報同期関数                                          |
+//+------------------------------------------------------------------+
+void SyncPositionData()
+  {
+   for(int i = 0; i < 3; i++)
+     {
+      string symbol = GetSymbolByIndex(i);
+      if(symbol == "")
+         continue;
+
+      if(PositionSelect(symbol))
+        {
+         ulong ticket = PositionGetInteger(POSITION_TICKET);
+         // 新しいポジションを検出
+         if(positionInfo[i].ticket != ticket)
+           {
+            positionInfo[i].ticket = ticket;
+            positionInfo[i].entryPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+            positionInfo[i].entryTime = (datetime)PositionGetInteger(POSITION_TIME);
+            positionInfo[i].currentATR = GetATR(symbol, i);
+
+            // トレーリングストップ変数を初期化
+            positionInfo[i].bestPrice = positionInfo[i].entryPrice;
+            positionInfo[i].trailingActivated = false;
+            positionInfo[i].trailingStart = 0;
+            positionInfo[i].lastTrailBar = 0;
+
+            // 初期SL/TP計算（ATRを使用）
+            double range = GetAverageRange(symbol, GetSymbolIndex(symbol));
+            if(range > 0)
+              {
+               if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY)
+                 {
+                  positionInfo[i].slPrice = positionInfo[i].entryPrice - range * ATR_Multiplier;
+                  positionInfo[i].tpPrice = positionInfo[i].entryPrice + range * TP_ATR_Multiplier;
+
+                  // トレーリング開始価格を計算
+                  positionInfo[i].trailingStart = positionInfo[i].entryPrice + range * TrailingStart_ATR;
+                 }
+               else
+                 {
+                  positionInfo[i].slPrice = positionInfo[i].entryPrice + range * ATR_Multiplier;
+                  positionInfo[i].tpPrice = positionInfo[i].entryPrice - range * TP_ATR_Multiplier;
+
+                  // トレーリング開始価格を計算
+                  positionInfo[i].trailingStart = positionInfo[i].entryPrice - range * TrailingStart_ATR;
+                 }
+              }
+            Print("New position detected for ", symbol,
+                  " Ticket: ", ticket,
+                  " Entry: ", positionInfo[i].entryPrice,
+                  " SL: ", positionInfo[i].slPrice,
+                  " TP: ", positionInfo[i].tpPrice,
+                  " Trailing Start: ", positionInfo[i].trailingStart,
+                  " Current ATR: ", positionInfo[i].currentATR);
+           }
+        }
+      else
+        {
+         // ポジションが存在しない場合、内部データをリセット
+         if(positionInfo[i].ticket != 0)
+           {
+            positionInfo[i].slPrice = 0;
+            positionInfo[i].tpPrice = 0;
+            positionInfo[i].ticket = 0;
+            positionInfo[i].confidence = 0;
+            positionInfo[i].bestPrice = 0;
+            positionInfo[i].trailingActivated = false;
+            positionInfo[i].trailingStart = 0;
+            positionInfo[i].currentATR = 0;
+            positionInfo[i].lastTrailBar = 0;
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| トレーリングストップ処理関数                                    |
+//+------------------------------------------------------------------+
+void ProcessTrailingStop()
+  {
+   for(int i = 0; i < 3; i++)
+     {
+      string symbol = GetSymbolByIndex(i);
+      if(symbol == "" || positionInfo[i].ticket == 0)
+         continue;
+
+      if(!PositionSelect(symbol))
+         continue;
+
+      // 現在のポジション情報を取得
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double currentPrice = (posType == POSITION_TYPE_BUY) ?
+                            SymbolInfoDouble(symbol, SYMBOL_BID) :
+                            SymbolInfoDouble(symbol, SYMBOL_ASK);
+
+      // トレーリング間隔チェック（バー数ベース）
+      datetime currentBarTime = iTime(symbol, _Period, 0);
+      int barIndex = iBarShift(symbol, _Period, currentBarTime);
+
+      if(MathAbs(barIndex - positionInfo[i].lastTrailBar) < TrailEveryXBars)
+        {
+         continue; // トレーリング間隔が経過していない
+        }
+
+      // 最良価格を更新
+      if(posType == POSITION_TYPE_BUY)
+        {
+         if(currentPrice > positionInfo[i].bestPrice)
+           {
+            positionInfo[i].bestPrice = currentPrice;
+           }
+        }
+      else
+        {
+         if(currentPrice < positionInfo[i].bestPrice)
+           {
+            positionInfo[i].bestPrice = currentPrice;
+           }
+        }
+
+      // トレーリング開始条件チェック
+      if(!positionInfo[i].trailingActivated)
+        {
+         if(posType == POSITION_TYPE_BUY && currentPrice >= positionInfo[i].trailingStart)
+           {
+            positionInfo[i].trailingActivated = true;
+            Print("Trailing stop activated for BUY position: ", symbol,
+                  " Current: ", currentPrice,
+                  " Trailing Start: ", positionInfo[i].trailingStart);
+           }
+         else
+            if(posType == POSITION_TYPE_SELL && currentPrice <= positionInfo[i].trailingStart)
+              {
+               positionInfo[i].trailingActivated = true;
+               Print("Trailing stop activated for SELL position: ", symbol,
+                     " Current: ", currentPrice,
+                     " Trailing Start: ", positionInfo[i].trailingStart);
+              }
+        }
+
+      // トレーリング実行
+      if(positionInfo[i].trailingActivated)
+        {
+         double newSlPrice = CalculateTrailingStop(symbol, i, posType, currentPrice);
+
+         // ストップロスを更新（改善された場合のみ）
+         if(posType == POSITION_TYPE_BUY && newSlPrice > positionInfo[i].slPrice)
+           {
+            UpdateStopLoss(symbol, i, newSlPrice);
+            positionInfo[i].lastTrailBar = barIndex;
+           }
+         else
+            if(posType == POSITION_TYPE_SELL && newSlPrice < positionInfo[i].slPrice)
+              {
+               UpdateStopLoss(symbol, i, newSlPrice);
+               positionInfo[i].lastTrailBar = barIndex;
+              }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| トレーリングストップ価格を計算                                  |
+//+------------------------------------------------------------------+
+double CalculateTrailingStop(string symbol, int symbolIndex, ENUM_POSITION_TYPE posType, double currentPrice)
+  {
+   double trailDistance = positionInfo[symbolIndex].currentATR * TrailingStep_ATR;
+   double newSlPrice = 0;
+
+   if(posType == POSITION_TYPE_BUY)
+     {
+      if(UsePartialTrailing)
+        {
+         // 部分的なトレーリング：最良価格から固定距離
+         newSlPrice = positionInfo[symbolIndex].bestPrice - trailDistance;
+        }
+      else
+        {
+         // 完全なトレーリング：現在価格から固定距離
+         newSlPrice = currentPrice - trailDistance;
+        }
+
+      // 最低でも初期ストップロスよりは良い価格に設定
+      double initialSl = positionInfo[symbolIndex].entryPrice -
+                         positionInfo[symbolIndex].currentATR * ATR_Multiplier;
+      newSlPrice = MathMax(newSlPrice, initialSl);
+
+     }
+   else
+      if(posType == POSITION_TYPE_SELL)
+        {
+         if(UsePartialTrailing)
+           {
+            // 部分的なトレーリング：最良価格から固定距離
+            newSlPrice = positionInfo[symbolIndex].bestPrice + trailDistance;
+           }
+         else
+           {
+            // 完全なトレーリング：現在価格から固定距離
+            newSlPrice = currentPrice + trailDistance;
+           }
+
+         // 最低でも初期ストップロスよりは良い価格に設定
+         double initialSl = positionInfo[symbolIndex].entryPrice +
+                            positionInfo[symbolIndex].currentATR * ATR_Multiplier;
+         newSlPrice = MathMin(newSlPrice, initialSl);
+        }
+
+   return newSlPrice;
+  }
+
+//+------------------------------------------------------------------+
+//| ストップロスを更新                                              |
+//+------------------------------------------------------------------+
+void UpdateStopLoss(string symbol, int symbolIndex, double newSlPrice)
+  {
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+
+   request.action = TRADE_ACTION_SLTP;
+   request.symbol = symbol;
+   request.position = positionInfo[symbolIndex].ticket;
+   request.sl = newSlPrice;
+   request.tp = 0; // TPは変更しない
+   request.magic = 0;
+
+// 価格を正規化
+   double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(tickSize > 0 && point > 0)
+     {
+      request.sl = NormalizeDouble(request.sl / point, 0) * point;
+     }
+
+// 注文送信
+   if(OrderSend(request, result))
+     {
+      positionInfo[symbolIndex].slPrice = newSlPrice;
+      Print("Trailing stop updated for ", symbol,
+            " New SL: ", DoubleToString(newSlPrice, 5),
+            " Best Price: ", DoubleToString(positionInfo[symbolIndex].bestPrice, 5),
+            " Profit: ", DoubleToString(PositionGetDouble(POSITION_PROFIT), 2));
+     }
+   else
+     {
+      Print("Failed to update trailing stop for ", symbol,
+            " Error: ", GetLastError(),
+            " Requested SL: ", DoubleToString(newSlPrice, 5));
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| 新しいバーチェック                                               |
+//+------------------------------------------------------------------+
+void CheckNewBar(string symbol, datetime &lastBarTime, int symbolIndex)
+  {
+   datetime currentTime[1];
+   if(CopyTime(symbol, _Period, 0, 1, currentTime) == 1)
+     {
+      if(currentTime[0] != lastBarTime)
+        {
+         lastBarTime = currentTime[0];
+         ProcessTrading(symbol, symbolIndex);
+         CheckExitConditions(symbol, symbolIndex);
+         // トレーリングストップ処理
+         if(EnableTrailingStop)
+           {
+            ProcessTrailingStop();
+           }
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| 取引処理                                                        |
+//+------------------------------------------------------------------+
+void ProcessTrading(string symbol, int symbolIndex)
+  {
+   double inputs[2]; // 2つの入力特徴量（RSI + ボリンジャーバンド位置）
+   PrepareInputData(symbol, symbolIndex, inputs);
+
+   double prediction = NeuralNetwork(inputs);
+   ExecuteTrade(symbol, symbolIndex, prediction);
+  }
+
+//+------------------------------------------------------------------+
+//| ATR値を取得                                                     |
+//+------------------------------------------------------------------+
+double GetATR(string symbol, int symbolIndex)
+  {
+   double atrValue[1];
+   if(CopyBuffer(atrHandles[symbolIndex], 0, 0, 1, atrValue) == 1)
+     {
+      return atrValue[0];
+     }
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| 平均変動幅取得（ATRを使用）                                      |
+//+------------------------------------------------------------------+
+double GetAverageRange(string symbol, int symbolIndex)
+  {
+   double atr[1];
+   if(CopyBuffer(atrHandles[symbolIndex], 0, 1, 1, atr) == 1)
+     {
+      return atr[0];
+     }
+   Print("Error: Failed to get ATR value for ", symbol);
+   return 0;
+  }
+
+//+------------------------------------------------------------------+
+//| tanh活性化関数                                                   |
+//+------------------------------------------------------------------+
+double tanhActivation(double x)
+  {
+// 双曲線正接関数の実装
+   double exp2x = MathExp(2 * TanhAlpha * x);
+   return (exp2x - 1) / (exp2x + 1);
+  }
+
+//+------------------------------------------------------------------+
+//| ニューラルネットワーク (2-3-1構造) - tanh活性化関数のみ使用     |
+//+------------------------------------------------------------------+
+double NeuralNetwork(double &inputs[])
+  {
+// 隠れ層の計算 (3ユニット)
+   double h1[3];
+// 入力層(2) → 隠れ層(3)の計算
+   h1[0] = inputs[0]*w1_0_0 + inputs[1]*w1_1_0 + b1_0;
+   h1[1] = inputs[0]*w1_0_1 + inputs[1]*w1_1_1 + b1_1;
+   h1[2] = inputs[0]*w1_0_2 + inputs[1]*w1_1_2 + b1_2;
+
+// Tanh活性化関数（隠れ層）
+   for(int i=0; i<3; i++)
+     {
+      h1[i] = tanhActivation(h1[i]);
+     }
+
+// 出力層の計算
+   double output = h1[0]*w2_0 + h1[1]*w2_1 + h1[2]*w2_2 + b2;
+
+// Tanh活性化関数を適用（出力範囲: -1.0～1.0）
+   return tanhActivation(output);
+  }
+
+//+------------------------------------------------------------------+
+//| tanh出力に基づくロット乗数を計算（-1.0～1.0の範囲）             |
+//+------------------------------------------------------------------+
+double CalculateLotMultiplier(double prediction, ENUM_ORDER_TYPE orderType)
+  {
+   if(!UseDynamicLot)
+      return 1.0;
+
+   double confidence = 0.0;
+
+   if(orderType == ORDER_TYPE_BUY)
+     {
+      // 買いの場合：predictionがBuyThreshold～1.0
+      if(prediction >= BuyThreshold)
+        {
+         // 信頼度を0.0～1.0に正規化
+         confidence = (prediction - BuyThreshold) / (1.0 - BuyThreshold);
+        }
+     }
+   else
+      if(orderType == ORDER_TYPE_SELL)
+        {
+         // 売りの場合：predictionが-1.0～SellThreshold
+         if(prediction <= SellThreshold)
+           {
+            // 信頼度を0.0～1.0に正規化（絶対値で計算）
+            confidence = (SellThreshold - prediction) / (SellThreshold + 1.0);
+           }
+        }
+      else
+        {
+         return 1.0;
+        }
+
+// 信頼度を0.0～1.0の範囲にクリップ
+   confidence = MathMax(0.0, MathMin(1.0, confidence));
+
+// 線形補間で乗数を計算
+   double multiplier = MinLotMultiplier + confidence * (MaxLotMultiplier - MinLotMultiplier);
+
+   return multiplier;
+  }
+
+//+------------------------------------------------------------------+
+//| ニューラルネットワーク出力に基づくリスク率を計算                 |
+//+------------------------------------------------------------------+
+double CalculateDynamicRiskPercent(double prediction, ENUM_ORDER_TYPE orderType)
+  {
+   if(!UseDynamicLot)
+      return RiskPercent;
+
+   double multiplier = CalculateLotMultiplier(prediction, orderType);
+   double dynamicRisk = RiskPercent * multiplier;
+
+// 最大リスク率で制限
+   dynamicRisk = MathMin(dynamicRisk, MaxRiskPercent);
+   dynamicRisk = MathMax(dynamicRisk, 0.1); // 最小0.1%
+
+   return dynamicRisk;
+  }
+
+//+------------------------------------------------------------------+
+//| 取引実行                                                        |
+//+------------------------------------------------------------------+
+void ExecuteTrade(string symbol, int symbolIndex, double prediction)
+  {
+// 現在ポジション確認
+   bool hasPosition = PositionSelect(symbol);
+   int currentPos = hasPosition ?
+                    (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 1 : -1) : 0;
+
+// デバッグ：定期的に予測値を表示
+   static int debugCounter = 0;
+   debugCounter++;
+   if(debugCounter % 100 == 0)
+     {
+      double inputs[2];
+      PrepareInputData(symbol, symbolIndex, inputs);
+      double rsiValue = GetRSI(symbol, symbolIndex);
+      double bbPosition = CalculateBBPosition(symbol, symbolIndex);
+
+      Print(symbol, " - Neural Network Output: ", DoubleToString(prediction, 4),
+            " (Buy threshold: ", BuyThreshold, ", Sell threshold: ", SellThreshold, ")",
+            " RSI: ", DoubleToString(rsiValue, 2),
+            " BB Position: ", DoubleToString(bbPosition, 4));
+     }
+
+// 反対方向のポジションがあれば決済
+   if(prediction >= BuyThreshold && currentPos < 0)
+     {
+      Print("Closing SELL position due to BUY signal. Prediction: ", DoubleToString(prediction, 4));
+      ClosePosition(symbol);
+      currentPos = 0; // ポジション状態を更新
+     }
+   else
+      if(prediction <= SellThreshold && currentPos > 0)
+        {
+         Print("Closing BUY position due to SELL signal. Prediction: ", DoubleToString(prediction, 4));
+         ClosePosition(symbol);
+         currentPos = 0; // ポジション状態を更新
+        }
+
+// エントリー条件：BuyThreshold以上で買い、SellThreshold以下で売り
+// 現在ポジションなしの場合のみエントリー
+   if(prediction >= BuyThreshold && currentPos == 0)
+     {
+      double range = GetAverageRange(symbol, symbolIndex);
+      if(range <= 0)
+        {
+         Print("Warning: Invalid range for ", symbol);
+         return;
+        }
+
+      // ニューラルネットワークの信頼度に基づく動的ロット計算
+      double baseLot = CalculateBaseLotSize(symbol, range);
+      if(baseLot <= 0)
+        {
+         Print("Warning: Invalid base lot for ", symbol);
+         return;
+        }
+
+      double lotMultiplier = CalculateLotMultiplier(prediction, ORDER_TYPE_BUY);
+      double lot = baseLot * lotMultiplier;
+
+      // ロットの最小・最大・ステップを考慮して正規化
+      lot = NormalizeLotSize(symbol, lot);
+      if(lot <= 0)
+        {
+         Print("Warning: Invalid lot size for ", symbol);
+         return;
+        }
+
+      // エントリー価格（現在のAsk）
+      double price = SymbolInfoDouble(symbol, SYMBOL_ASK);
+
+      // ストップロス価格計算
+      double slPrice = price - range * ATR_Multiplier;
+
+      // テイクプロフィット価格計算
+      double tpPrice = price + range * TP_ATR_Multiplier;
+
+      // ポジション開設
+      if(ExecuteOrder(symbol, ORDER_TYPE_BUY, lot, slPrice, tpPrice, symbolIndex, prediction))
+        {
+         Print("BUY signal executed: ", symbol,
+               " Prediction: ", DoubleToString(prediction, 4),
+               " Lot multiplier: ", DoubleToString(lotMultiplier, 2),
+               " Lot size: ", DoubleToString(lot, 2),
+               " Price: ", DoubleToString(price, 5));
+        }
+     }
+   else
+      if(prediction <= SellThreshold && currentPos == 0)
+        {
+         double range = GetAverageRange(symbol, symbolIndex);
+         if(range <= 0)
+           {
+            Print("Warning: Invalid range for ", symbol);
+            return;
+           }
+
+         // ニューラルネットワークの信頼度に基づく動的ロット計算
+         double baseLot = CalculateBaseLotSize(symbol, range);
+         if(baseLot <= 0)
+           {
+            Print("Warning: Invalid base lot for ", symbol);
+            return;
+           }
+
+         double lotMultiplier = CalculateLotMultiplier(prediction, ORDER_TYPE_SELL);
+         double lot = baseLot * lotMultiplier;
+
+         // ロットの最小・最大・ステップを考慮して正規化
+         lot = NormalizeLotSize(symbol, lot);
+         if(lot <= 0)
+           {
+            Print("Warning: Invalid lot size for ", symbol);
+            return;
+           }
+
+         // エントリー価格（現在のBid）
+         double price = SymbolInfoDouble(symbol, SYMBOL_BID);
+
+         // ストップロス価格計算
+         double slPrice = price + range * ATR_Multiplier;
+
+         // テイクプロフィット価格計算
+         double tpPrice = price - range * TP_ATR_Multiplier;
+
+         // ポジション開設
+         if(ExecuteOrder(symbol, ORDER_TYPE_SELL, lot, slPrice, tpPrice, symbolIndex, prediction))
+           {
+            Print("SELL signal executed: ", symbol,
+                  " Prediction: ", DoubleToString(prediction, 4),
+                  " Lot multiplier: ", DoubleToString(lotMultiplier, 2),
+                  " Lot size: ", DoubleToString(lot, 2),
+                  " Price: ", DoubleToString(price, 5));
+           }
+        }
+      else
+         if(prediction > SellThreshold && prediction < BuyThreshold)
+           {
+            // 中立ゾーン：predictionがSellThreshold～BuyThresholdの間
+            if(debugCounter % 100 == 0)   // 頻繁にログ出力しない
+              {
+               Print("Neutral zone - No trade: ", symbol,
+                     " Prediction: ", DoubleToString(prediction, 4),
+                     " (Buy threshold: ", BuyThreshold,
+                     ", Sell threshold: ", SellThreshold, ")");
+              }
+           }
+  }
+
+//+------------------------------------------------------------------+
+//| 基本ロットサイズ計算（動的リスク率を使用）                      |
+//+------------------------------------------------------------------+
+double CalculateBaseLotSize(string symbol, double range)
+  {
+// リスク管理：ボラティリティ適応型
+   double slDistance = range * ATR_Multiplier;
+   double slPoints = slDistance / SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+// 1ポイントあたりの価値（1ロット当たり）を計算
+   double tickValue = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_VALUE);
+   double tickSize = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+
+// 計算の安全チェック
+   if(tickSize <= 0 || point <= 0)
+     {
+      Print("Error: Invalid tickSize or point for ", symbol);
+      return 0;
+     }
+
+   double valuePerPoint = tickValue / (tickSize / point);
+   if(valuePerPoint <= 0)
+     {
+      Print("Error: Invalid valuePerPoint for ", symbol);
+      return 0;
+     }
+
+// 基本リスク額計算（口座残高の%）
+   double riskMoney = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0;
+
+// 基本ロットサイズ計算
+   double baseLot = riskMoney / (slPoints * valuePerPoint);
+
+   return baseLot;
+  }
+
+//+------------------------------------------------------------------+
+//| ロットサイズを正規化                                            |
+//+------------------------------------------------------------------+
+double NormalizeLotSize(string symbol, double lot)
+  {
+// ロットサイズの最小・最大値チェック
+   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double lotStep = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+
+   if(minLot <= 0 || maxLot <= 0 || lotStep <= 0)
+     {
+      Print("Error: Invalid lot size parameters for ", symbol);
+      return 0;
+     }
+
+   lot = MathMax(lot, minLot);
+   lot = MathMin(lot, maxLot);
+   lot = NormalizeDouble(lot / lotStep, 0) * lotStep;
+
+   return lot;
+  }
+
+//+------------------------------------------------------------------+
+//| 注文実行                                                        |
+//+------------------------------------------------------------------+
+bool ExecuteOrder(string symbol, ENUM_ORDER_TYPE orderType, double lot, double slPrice, double tpPrice, int symbolIndex, double prediction)
+  {
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   int retryCount = 0;
+   const int maxRetries = 3;
+   int waitMs = 200;
+
+// 取引が許可されているか確認
+   if(!IsTradeAllowed(symbol))
+      return false;
+
+   while(retryCount < maxRetries)
+     {
+      // リクエスト設定
+      request.action = TRADE_ACTION_DEAL;
+      request.symbol = symbol;
+      request.volume = lot;
+      request.type = orderType;
+      request.type_filling = input_Filling_type;
+      request.price = orderType == ORDER_TYPE_BUY ?
+                      SymbolInfoDouble(symbol, SYMBOL_ASK) :
+                      SymbolInfoDouble(symbol, SYMBOL_BID);
+      request.deviation = 100;
+      request.sl = 0;
+      request.tp = 0;
+
+      // 注文実行
+      bool success = OrderSend(request, result);
+
+      if(success)
+        {
+         // ポジション情報を内部記録
+         positionInfo[symbolIndex].slPrice = slPrice;
+         positionInfo[symbolIndex].tpPrice = tpPrice;
+         positionInfo[symbolIndex].entryPrice = result.price;
+         positionInfo[symbolIndex].entryTime = TimeCurrent();
+         positionInfo[symbolIndex].ticket = result.deal;
+         positionInfo[symbolIndex].confidence = prediction;
+         positionInfo[symbolIndex].currentATR = GetAverageRange(symbol, symbolIndex);
+         positionInfo[symbolIndex].bestPrice = result.price;
+
+         // トレーリング開始価格計算
+         double range = positionInfo[symbolIndex].currentATR;
+         if(orderType == ORDER_TYPE_BUY)
+           {
+            positionInfo[symbolIndex].trailingStart = result.price + range * TrailingStart_ATR;
+           }
+         else
+           {
+            positionInfo[symbolIndex].trailingStart = result.price - range * TrailingStart_ATR;
+           }
+
+         positionInfo[symbolIndex].trailingActivated = false;
+         positionInfo[symbolIndex].lastTrailBar = iBarShift(symbol, _Period, iTime(symbol, _Period, 0));
+
+         Print("Order executed: ", symbol,
+               " Type: ", EnumToString(orderType),
+               " Prediction: ", DoubleToString(prediction, 4),
+               " Lot: ", DoubleToString(lot, 2),
+               " Price: ", DoubleToString(result.price, 5),
+               " SL: ", DoubleToString(slPrice, 5),
+               " TP: ", DoubleToString(tpPrice, 5),
+               " Trailing Start: ", DoubleToString(positionInfo[symbolIndex].trailingStart, 5),
+               " Current ATR: ", DoubleToString(positionInfo[symbolIndex].currentATR, 5));
+         return true;
+        }
+      else
+        {
+         int errorCode = GetLastError();
+         string errorDesc = GetErrorDescription(errorCode);
+
+         Print("Order failed (Attempt ", retryCount+1, "): ",
+               "Error ", errorCode, " - ", errorDesc,
+               " | Comment: ", result.comment);
+
+         // リトライ不可能な致命的エラーのチェック
+         if(IsCriticalError(errorCode))
+            return false;
+
+         // ロットサイズ関連エラーの処理
+         if(errorCode == 131 || errorCode == 134)
+           {
+            double newLot = AdjustLotSize(symbol, lot, errorCode);
+            if(newLot > 0 && newLot != lot)
+              {
+               Print("Adjusting lot size from ", DoubleToString(lot, 2), " to ", DoubleToString(newLot, 2));
+               lot = newLot;
+               continue;
+              }
+           }
+
+         retryCount++;
+         if(retryCount < maxRetries)
+           {
+            Print("Retrying in ", waitMs, "ms...");
+            Sleep(waitMs);
+           }
+        }
+     }
+
+   Print("Order failed after ", maxRetries, " attempts");
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| 退出条件チェック（確定足の終値ベース）                          |
+//+------------------------------------------------------------------+
+void CheckExitConditions(string symbol, int symbolIndex)
+  {
+   if(positionInfo[symbolIndex].slPrice == 0 || positionInfo[symbolIndex].tpPrice == 0)
+      return;
+
+// 確定足の終値を使用
+   double close = iClose(symbol, _Period, 1);
+
+   if(PositionSelect(symbol))
+     {
+      bool shouldClose = false;
+      string closeReason = "";
+      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+
+      if(posType == POSITION_TYPE_BUY)
+        {
+         if(close <= positionInfo[symbolIndex].slPrice)
+           {
+            shouldClose = true;
+            closeReason = "SL";
+           }
+         else
+            if(close >= positionInfo[symbolIndex].tpPrice)
+              {
+               shouldClose = true;
+               closeReason = "TP";
+              }
+        }
+      else
+         if(posType == POSITION_TYPE_SELL)
+           {
+            if(close >= positionInfo[symbolIndex].slPrice)
+              {
+               shouldClose = true;
+               closeReason = "SL";
+              }
+            else
+               if(close <= positionInfo[symbolIndex].tpPrice)
+                 {
+                  shouldClose = true;
+                  closeReason = "TP";
+                 }
+           }
+
+      if(shouldClose)
+        {
+         ClosePosition(symbol);
+         positionInfo[symbolIndex].slPrice = 0;
+         positionInfo[symbolIndex].tpPrice = 0;
+         positionInfo[symbolIndex].confidence = 0;
+         positionInfo[symbolIndex].bestPrice = 0;
+         positionInfo[symbolIndex].trailingActivated = false;
+         positionInfo[symbolIndex].trailingStart = 0;
+
+         Print(closeReason, " triggered: ", symbol,
+               " Close Price: ", DoubleToString(close, 5),
+               " SL: ", DoubleToString(positionInfo[symbolIndex].slPrice, 5),
+               " TP: ", DoubleToString(positionInfo[symbolIndex].tpPrice, 5));
+        }
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| ポジション決済                                                  |
+//+------------------------------------------------------------------+
+void ClosePosition(string symbol)
+  {
+   MqlTradeRequest request = {};
+   MqlTradeResult result = {};
+   int retryCount = 0;
+   const int maxRetries = 3;
+
+   if(!PositionSelect(symbol))
+      return;
+
+   double volume = PositionGetDouble(POSITION_VOLUME);
+   ENUM_ORDER_TYPE type = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ?
+                          ORDER_TYPE_SELL : ORDER_TYPE_BUY;
+
+   while(retryCount < maxRetries)
+     {
+      request.action = TRADE_ACTION_DEAL;
+      request.symbol = symbol;
+      request.volume = volume;
+      request.type = type;
+      request.type_filling = input_Filling_type;
+      request.position = PositionGetInteger(POSITION_TICKET);
+      request.price = type == ORDER_TYPE_BUY ?
+                      SymbolInfoDouble(symbol, SYMBOL_ASK) :
+                      SymbolInfoDouble(symbol, SYMBOL_BID);
+      request.deviation = 100;
+
+      if(OrderSend(request, result))
+        {
+         Print("Position closed: ", symbol, " Volume: ", DoubleToString(volume, 2));
+         return;
+        }
+      else
+        {
+         int errorCode = GetLastError();
+         Print("Close position failed (Attempt ", retryCount+1, "): ",
+               "Error ", errorCode, " - ", GetErrorDescription(errorCode),
+               " | Comment: ", result.comment);
+
+         if(IsCriticalError(errorCode))
+            return;
+
+         retryCount++;
+         if(retryCount < maxRetries)
+            Sleep(200);
+        }
+     }
+
+   Print("Close position failed after ", maxRetries, " attempts");
+  }
+
+//+------------------------------------------------------------------+
+//| 通貨インデックス取得                                             |
+//+------------------------------------------------------------------+
+int GetSymbolIndex(string symbol)
+  {
+   if(symbol == Symbol1)
+      return 0;
+   if(symbol == Symbol2)
+      return 1;
+   if(symbol == Symbol3)
+      return 2;
+   return -1;
+  }
+
+//+------------------------------------------------------------------+
+//| インデックスから通貨ペアを取得                                    |
+//+------------------------------------------------------------------+
+string GetSymbolByIndex(int index)
+  {
+   switch(index)
+     {
+      case 0:
+         return Symbol1;
+      case 1:
+         return Symbol2;
+      case 2:
+         return Symbol3;
+      default:
+         return "";
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| エラー説明を取得                                                |
+//+------------------------------------------------------------------+
+string GetErrorDescription(int errorCode)
+  {
+   switch(errorCode)
+     {
+      case 0:
+         return "No error";
+      case 1:
+         return "No error, trade succeeded";
+      case 2:
+         return "Common error";
+      case 3:
+         return "Invalid trade parameters";
+      case 4:
+         return "Trade server is busy";
+      case 5:
+         return "Old version of the client terminal";
+      case 6:
+         return "No connection with trade server";
+      case 7:
+         return "Not enough rights";
+      case 8:
+         return "Too frequent requests";
+      case 9:
+         return "Malfunctional trade operation";
+      case 64:
+         return "Account disabled";
+      case 65:
+         return "Invalid account";
+      case 128:
+         return "Trade timeout";
+      case 129:
+         return "Invalid price";
+      case 130:
+         return "Invalid stops";
+      case 131:
+         return "Invalid trade volume";
+      case 132:
+         return "Market is closed";
+      case 133:
+         return "Trade is disabled";
+      case 134:
+         return "Not enough money";
+      case 135:
+         return "Price changed";
+      case 136:
+         return "Off quotes";
+      case 137:
+         return "Broker is busy";
+      case 138:
+         return "Requote";
+      case 139:
+         return "Order is locked";
+      case 140:
+         return "Long positions only allowed";
+      case 141:
+         return "Too many requests";
+      case 145:
+         return "Modification denied because order is too close to market";
+      case 146:
+         return "Trade context is busy";
+      case 147:
+         return "Expirations are denied by broker";
+      case 148:
+         return "The amount of open and pending orders has reached the limit";
+      case 149:
+         return "Hedging is prohibited";
+      case 150:
+         return "Prohibited by FIFO rules";
+      default:
+         return "Unknown error";
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| 致命的エラーのチェック                                          |
+//+------------------------------------------------------------------+
+bool IsCriticalError(int errorCode)
+  {
+   int criticalErrors[] = {133, 139, 145, 146, 147, 148, 149, 150, 4051};
+   for(int i=0; i<ArraySize(criticalErrors); i++)
+      if(errorCode == criticalErrors[i])
+         return true;
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| ロットサイズ調整                                                |
+//+------------------------------------------------------------------+
+double AdjustLotSize(string symbol, double requestedLot, int errorCode)
+  {
+   double minLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MIN);
+   double maxLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_MAX);
+   double stepLot = SymbolInfoDouble(symbol, SYMBOL_VOLUME_STEP);
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+// 無効なロットサイズエラー (131)
+   if(errorCode == 131)
+     {
+      if(requestedLot < minLot)
+         return minLot;
+      if(requestedLot > maxLot)
+         return maxLot;
+
+      double adjustedLot = NormalizeDouble(requestedLot / stepLot, 0) * stepLot;
+      if(adjustedLot != requestedLot)
+         return adjustedLot;
+     }
+
+// 資金不足エラー (134)
+   if(errorCode == 134)
+     {
+      double marginRequired;
+      if(OrderCalcMargin(ORDER_TYPE_BUY, symbol, requestedLot, SymbolInfoDouble(symbol, SYMBOL_ASK), marginRequired))
+        {
+         double maxAffordableLot = requestedLot;
+         while(marginRequired > equity * 0.8 && maxAffordableLot > minLot)
+           {
+            maxAffordableLot -= stepLot;
+            if(!OrderCalcMargin(ORDER_TYPE_BUY, symbol, maxAffordableLot, SymbolInfoDouble(symbol, SYMBOL_ASK), marginRequired))
+               break;
+           }
+         if(maxAffordableLot >= minLot)
+            return maxAffordableLot;
+        }
+     }
+   return -1;
+  }
+
+//+------------------------------------------------------------------+
+//| 取引が許可されているか確認                                      |
+//+------------------------------------------------------------------+
+bool IsTradeAllowed(string symbol)
+  {
+   if(!SymbolInfoInteger(symbol, SYMBOL_SELECT))
+      return false;
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))
+      return false;
+   if(!SymbolInfoInteger(symbol, SYMBOL_TRADE_MODE))
+      return false;
+   if(AccountInfoInteger(ACCOUNT_TRADE_EXPERT) == 0)
+      return false;
+   if(AccountInfoDouble(ACCOUNT_MARGIN_LEVEL) > 0 &&
+      AccountInfoDouble(ACCOUNT_MARGIN_LEVEL) < 100)
+      return false;
+   return true;
+  }
+
+//+------------------------------------------------------------------+
+//| ニューラルネットワーク出力の診断用関数                           |
+//+------------------------------------------------------------------+
+void AnalyzeNeuralNetworkOutput()
+  {
+   static datetime lastAnalysis = 0;
+   if(TimeCurrent() - lastAnalysis < 3600)
+      return; // 1時間ごとに実行
+
+   lastAnalysis = TimeCurrent();
+
+   Print("=== Neural Network Output Analysis (RSI & Bollinger Bands Position) ===");
+
+   for(int i = 0; i < 3; i++)
+     {
+      string symbol = GetSymbolByIndex(i);
+      if(symbol == "" || rsiHandles[i] == INVALID_HANDLE)
+         continue;
+
+      double inputs[2];
+      PrepareInputData(symbol, i, inputs);
+      double prediction = NeuralNetwork(inputs);
+
+      double rsiValue = GetRSI(symbol, i);
+      double bbPosition = CalculateBBPosition(symbol, i);
+
+      string signalType = "NEUTRAL";
+      if(prediction >= BuyThreshold)
+         signalType = "BUY";
+      else
+         if(prediction <= SellThreshold)
+            signalType = "SELL";
+
+      string rsiCondition = "NEUTRAL";
+      if(rsiValue > 70)
+         rsiCondition = "OVERBOUGHT";
+      else
+         if(rsiValue > 55)
+            rsiCondition = "BULLISH";
+         else
+            if(rsiValue < 30)
+               rsiCondition = "OVERSOLD";
+            else
+               if(rsiValue < 45)
+                  rsiCondition = "BEARISH";
+
+      string bbCondition = "NEUTRAL";
+      if(bbPosition > 0.8)
+         bbCondition = "UPPER BAND";
+      else
+         if(bbPosition > 0.6)
+            bbCondition = "UPPER HALF";
+         else
+            if(bbPosition < 0.2)
+               bbCondition = "LOWER BAND";
+            else
+               if(bbPosition < 0.4)
+                  bbCondition = "LOWER HALF";
+
+      Print(symbol, ": RSI=", DoubleToString(rsiValue, 2), " (", rsiCondition, ")",
+            ", BB Position=", DoubleToString(bbPosition, 4), " (", bbCondition, ")",
+            " -> Prediction=", DoubleToString(prediction, 4),
+            " (", signalType, ")");
+     }
+   Print("=================================================================");
+  }
+//+------------------------------------------------------------------+
