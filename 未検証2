@@ -1,0 +1,282 @@
+//+------------------------------------------------------------------+
+//|                                      DecisionTreeRegimeEA.mq5    |
+//|                                  Explainable AI by Rule-Based    |
+//|                                                                  |
+//+------------------------------------------------------------------+
+#property copyright "AI Assistant"
+#property version   "3.00"
+#property description "決定木ベースEA - 説明可能なルールで運用"
+#property description "レジーム判定 → ルール適合 → エントリー"
+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+//--- 入力パラメータ（調整は最小限に）
+input double   InpLotSize           = 0.01;      // 基本ロット
+input int      InpMagicNumber       = 20250615;  // マジックナンバー
+input int      InpSlippage          = 10;        // スリッページ
+
+//--- レジーム判定用
+input int      InpRegimeADXPeriod   = 14;        // ADX期間
+input double   InpRegimeADXThreshold= 25.0;      // トレンド判定しきい値
+input int      InpRegimeATRPeriod   = 14;        // ATR期間
+input double   InpVolatilityCap     = 1.5;       // 高ボラリティ判定
+
+//--- ルールで使うインジケータ期間
+input int      InpRSIPeriod         = 14;        // RSI期間
+input int      InpMAPeriodFast      = 5;         // 短期MA
+input int      InpMAPeriodSlow      = 20;        // 長期MA
+input int      InpBBPeriod          = 20;        // ボリンジャー期間
+input double   InpBBDeviation       = 2.0;       // ボリンジャー偏差
+
+//--- リスク管理
+input double   InpStopLossPips      = 50.0;      // ストップロス(pips)
+input double   InpTakeProfitPips    = 100.0;     // テイクプロフィット
+input bool     InpUseTrailing       = true;      // トレーリング使用
+input double   InpTrailingStart     = 30.0;      // トレーリング開始(pips)
+input int      InpMaxPositions      = 1;         // 最大ポジション数
+
+//--- グローバル変数
+int      adxHandle, atrHandle, rsiHandle;
+int      fastMAHandle, slowMAHandle, bbHandle;
+double   point;
+int      digits;
+datetime lastBarTime = 0;
+double   currentATR = 0;
+
+//+------------------------------------------------------------------+
+//| 初期化                                                           |
+//+------------------------------------------------------------------+
+int OnInit() {
+   point   = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   digits  = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   
+   trade.SetExpertMagicNumber(InpMagicNumber);
+   trade.SetDeviationInPoints(InpSlippage);
+   
+   // インジケータハンドル作成
+   adxHandle   = iADX(_Symbol, _Period, InpRegimeADXPeriod);
+   atrHandle   = iATR(_Symbol, _Period, InpRegimeATRPeriod);
+   rsiHandle   = iRSI(_Symbol, _Period, InpRSIPeriod, PRICE_CLOSE);
+   fastMAHandle= iMA(_Symbol, _Period, InpMAPeriodFast, 0, MODE_SMA, PRICE_CLOSE);
+   slowMAHandle= iMA(_Symbol, _Period, InpMAPeriodSlow, 0, MODE_SMA, PRICE_CLOSE);
+   bbHandle    = iBands(_Symbol, _Period, InpBBPeriod, 0, InpBBDeviation, PRICE_CLOSE);
+   
+   if(adxHandle==INVALID_HANDLE || atrHandle==INVALID_HANDLE || 
+      rsiHandle==INVALID_HANDLE || fastMAHandle==INVALID_HANDLE || 
+      slowMAHandle==INVALID_HANDLE || bbHandle==INVALID_HANDLE)
+      return INIT_FAILED;
+   
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| 後処理                                                           |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {
+   IndicatorRelease(adxHandle); IndicatorRelease(atrHandle);
+   IndicatorRelease(rsiHandle); IndicatorRelease(fastMAHandle);
+   IndicatorRelease(slowMAHandle); IndicatorRelease(bbHandle);
+}
+
+//+------------------------------------------------------------------+
+//| メイン                                                           |
+//+------------------------------------------------------------------+
+void OnTick() {
+   datetime currentBar = iTime(_Symbol, _Period, 0);
+   if(lastBarTime == currentBar) return;
+   lastBarTime = currentBar;
+   
+   if(CountPositions() >= InpMaxPositions) return;
+   
+   // === ステップ1: レジーム判定 ===
+   int regime = GetMarketRegime();
+   if(regime == 0) return;  // 高ボラは様子見
+   
+   // === ステップ2: 決定木ルールでシグナル生成 ===
+   int signal = GetDecisionTreeSignal(regime);
+   
+   // === ステップ3: エントリー実行 ===
+   if(signal == 1) OpenOrder(ORDER_TYPE_BUY);
+   if(signal == -1) OpenOrder(ORDER_TYPE_SELL);
+   
+   // === ステップ4: トレーリング ===
+   if(InpUseTrailing) TrailingStop();
+}
+
+//+------------------------------------------------------------------+
+//| レジーム判定（戻り値: 1=トレンド, 2=レンジ, 0=高ボラ禁止）        |
+//+------------------------------------------------------------------+
+int GetMarketRegime() {
+   double adx[1], atr[1], atrMA[1];
+   CopyBuffer(adxHandle, 0, 0, 1, adx);
+   CopyBuffer(atrHandle, 0, 0, 1, atr);
+   
+   // ATR移動平均を計算
+   double atrValues[];
+   CopyBuffer(atrHandle, 0, 0, InpRegimeATRPeriod, atrValues);
+   double atrSum = 0;
+   for(int i=0; i<InpRegimeATRPeriod; i++) atrSum += atrValues[i];
+   double atrSMA = atrSum / InpRegimeATRPeriod;
+   
+   currentATR = atr[0];
+   double volRatio = atr[0] / atrSMA;
+   
+   // 高ボラリティ → エントリー禁止
+   if(volRatio > InpVolatilityCap) return 0;
+   
+   // トレンド相場 vs レンジ相場
+   if(adx[0] > InpRegimeADXThreshold) return 1;  // トレンド
+   return 2;  // レンジ
+}
+
+//+------------------------------------------------------------------+
+//| 決定木ルール（説明可能なif文で構成）                               |
+//| regime: 1=トレンド, 2=レンジ                                      |
+//+------------------------------------------------------------------+
+int GetDecisionTreeSignal(int regime) {
+   // === 必要な値を取得 ===
+   double rsi[1];
+   double fastMA[1], slowMA[1];
+   double bbLower[1], bbUpper[1];
+   double close1 = iClose(_Symbol, _Period, 1);
+   double close2 = iClose(_Symbol, _Period, 2);
+   
+   CopyBuffer(rsiHandle, 0, 0, 1, rsi);
+   CopyBuffer(fastMAHandle, 0, 0, 1, fastMA);
+   CopyBuffer(slowMAHandle, 0, 0, 1, slowMA);
+   CopyBuffer(bbHandle, 1, 0, 1, bbUpper);  // +1σ
+   CopyBuffer(bbHandle, 2, 0, 1, bbLower);  // -1σ
+   
+   double currentPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double prevReturn = (close1 - close2) / close2;  // 前日比リターン
+   
+   // ============================================
+   // ルール1: 高ボラ時は全エントリー禁止（レジーム判定済み）
+   // ============================================
+   
+   // ============================================
+   // ルール2: トレンド相場（regime == 1）
+   // ============================================
+   if(regime == 1) {
+      // 上昇トレンド判定（短期MA > 長期MA）
+      bool isUptrend = (fastMA[0] > slowMA[0]);
+      // 下降トレンド判定
+      bool isDowntrend = (fastMA[0] < slowMA[0]);
+      
+      // 買いルール: 上昇トレンド + RSIが買われ過ぎでない(70未満)
+      if(isUptrend && rsi[0] < 70) {
+         Print("[買いシグナル] トレンド相場: 上昇トレンド + RSI=", rsi[0]);
+         return 1;
+      }
+      
+      // 売りルール: 下降トレンド + RSIが売られ過ぎでない(30超)
+      if(isDowntrend && rsi[0] > 30) {
+         Print("[売りシグナル] トレンド相場: 下降トレンド + RSI=", rsi[0]);
+         return -1;
+      }
+   }
+   
+   // ============================================
+   // ルール3: レンジ相場（regime == 2）
+   // ============================================
+   if(regime == 2) {
+      // ボリンジャー逆張り
+      bool atLowerBB = (currentPrice <= bbLower[0]);
+      bool atUpperBB = (currentPrice >= bbUpper[0]);
+      
+      // 買いルール: 下限バンド + RSI売られ過ぎ(35未満)
+      if(atLowerBB && rsi[0] < 35) {
+         Print("[買いシグナル] レンジ相場: 下限BB + RSI=", rsi[0]);
+         return 1;
+      }
+      
+      // 売りルール: 上限バンド + RSI買われ過ぎ(65超)
+      if(atUpperBB && rsi[0] > 65) {
+         Print("[売りシグナル] レンジ相場: 上限BB + RSI=", rsi[0]);
+         return -1;
+      }
+      
+      // 補助ルール: 明確な反転確認（前日比が逆方向）
+      if(atLowerBB && prevReturn < -0.002) {  // 前日1%以上下落
+         Print("[買いシグナル] レンジ相場: 下限BB + 反転確認");
+         return 1;
+      }
+      if(atUpperBB && prevReturn > 0.002) {
+         Print("[売りシグナル] レンジ相場: 上限BB + 反転確認");
+         return -1;
+      }
+   }
+   
+   return 0;  // シグナルなし
+}
+
+//+------------------------------------------------------------------+
+//| ポジション数カウント                                              |
+//+------------------------------------------------------------------+
+int CountPositions() {
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(PositionSelectByTicket(ticket)) {
+         if(PositionGetInteger(POSITION_MAGIC) == InpMagicNumber &&
+            PositionGetString(POSITION_SYMBOL) == _Symbol)
+            count++;
+      }
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+//| 注文発行                                                         |
+//+------------------------------------------------------------------+
+void OpenOrder(ENUM_ORDER_TYPE orderType) {
+   double price = (orderType == ORDER_TYPE_BUY) ? 
+                  SymbolInfoDouble(_Symbol, SYMBOL_ASK) : 
+                  SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   
+   double sl = 0, tp = 0;
+   if(InpStopLossPips > 0) {
+      double slPrice = (orderType == ORDER_TYPE_BUY) ?
+                       price - InpStopLossPips * point * 10 :
+                       price + InpStopLossPips * point * 10;
+      sl = NormalizeDouble(slPrice, digits);
+   }
+   if(InpTakeProfitPips > 0) {
+      double tpPrice = (orderType == ORDER_TYPE_BUY) ?
+                       price + InpTakeProfitPips * point * 10 :
+                       price - InpTakeProfitPips * point * 10;
+      tp = NormalizeDouble(tpPrice, digits);
+   }
+   
+   trade.PositionOpen(_Symbol, orderType, InpLotSize, price, sl, tp, "TreeEA");
+}
+
+//+------------------------------------------------------------------+
+//| トレーリングストップ                                              |
+//+------------------------------------------------------------------+
+void TrailingStop() {
+   for(int i = PositionsTotal() - 1; i >= 0; i--) {
+      ulong ticket = PositionGetTicket(i);
+      if(!PositionSelectByTicket(ticket)) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double trailLevel = InpTrailingStart * point * 10;
+      
+      if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) {
+         double newSL = bid - trailLevel;
+         if(newSL > openPrice && (currentSL == 0 || newSL > currentSL))
+            trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+      }
+      else if(PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_SELL) {
+         double newSL = ask + trailLevel;
+         if(newSL < openPrice && (currentSL == 0 || newSL < currentSL))
+            trade.PositionModify(ticket, newSL, PositionGetDouble(POSITION_TP));
+      }
+   }
+}
+//+------------------------------------------------------------------+
